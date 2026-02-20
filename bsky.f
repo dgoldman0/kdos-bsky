@@ -232,13 +232,237 @@ VARIABLE _BSK-TS-YEAR
 \ =====================================================================
 \  §0 — End of Foundation Utilities
 \ =====================================================================
+
+\ =====================================================================
+\  §1  Minimal JSON Parser
+\ =====================================================================
+\
+\  Extracts specific key values from JSON API responses.  Not a full
+\  parser — scans for "key": patterns and extracts values.
+\  No network calls; testable with string literals at the ok prompt.
+
+\ ── Helpers ──
+
+\ /STRING ( addr len n -- addr+n len-n )  Advance string pointer
+\   Standard Forth word; defined here in case BIOS lacks it.
+: /STRING  ( addr len n -- addr+n len-n )
+    ROT OVER + -ROT - ;
+
+\ ── §1.1  Whitespace and Key Finder ──────────────────────────────
+
+\ JSON-SKIP-WS ( addr len -- addr' len' )  Skip JSON whitespace
+: JSON-SKIP-WS  ( addr len -- addr' len' )
+    BEGIN
+        DUP 0> WHILE
+        OVER C@ DUP 32 =          \ space
+        OVER 9 = OR                \ tab
+        OVER 10 = OR               \ LF
+        SWAP 13 = OR               \ CR
+    WHILE
+        1 /STRING
+    REPEAT THEN ;
+
+\ _JSON-MATCH? ( addr len paddr plen -- flag )
+\   True if the first plen bytes at addr match paddr.
+VARIABLE _JM-PA
+VARIABLE _JM-PL
+
+: _JSON-MATCH?  ( addr len paddr plen -- flag )
+    _JM-PL ! _JM-PA !               \ save pattern
+    DUP _JM-PL @ < IF               \ buffer too short?
+        2DROP 0 EXIT
+    THEN
+    DROP                             \ drop len; only addr remains
+    _JM-PL @ _JM-PA @ _JM-PL @ COMPARE 0= ;
+
+\ Build the search pattern "key": in a scratch buffer.
+CREATE _JSON-KPAT 128 ALLOT
+VARIABLE _JSON-KPAT-LEN
+VARIABLE _JK-AD
+VARIABLE _JK-LN
+
+: _JSON-BUILD-KPAT  ( kaddr klen -- )
+    _JK-LN ! _JK-AD !
+    34 _JSON-KPAT C!                             \ opening "
+    _JK-AD @ _JSON-KPAT 1+ _JK-LN @ CMOVE      \ copy key text
+    34 _JSON-KPAT 1+ _JK-LN @ + C!              \ closing "
+    58 _JSON-KPAT 2 + _JK-LN @ + C!             \ colon :
+    _JK-LN @ 3 + _JSON-KPAT-LEN ! ;             \ total = klen + 3
+
+\ JSON-FIND-KEY ( json-addr json-len key-addr key-len -- val-addr val-len | 0 0 )
+\   Scan json for "key": pattern.  Returns pointer to the value
+\   (after the colon + whitespace), and remaining buffer length.
+: JSON-FIND-KEY  ( jaddr jlen kaddr klen -- vaddr vlen | 0 0 )
+    _JSON-BUILD-KPAT                 \ build "key": in _JSON-KPAT
+    BEGIN
+        DUP 0>
+    WHILE
+        2DUP _JSON-KPAT _JSON-KPAT-LEN @ _JSON-MATCH? IF
+            _JSON-KPAT-LEN @ /STRING
+            JSON-SKIP-WS
+            EXIT
+        THEN
+        1 /STRING
+    REPEAT
+    2DROP 0 0 ;
+
+\ ── §1.2  Value Extractors ────────────────────────────────────────
+
+\ JSON-GET-STRING ( addr len -- str-addr str-len )
+\   Extract string value.  addr must point at the opening " quote.
+\   Returns the inner string (without quotes).  Does NOT unescape.
+: JSON-GET-STRING  ( addr len -- str-addr str-len )
+    OVER C@ 34 <> IF 2DROP 0 0 EXIT THEN
+    1 /STRING                        \ skip opening "
+    OVER                             ( addr' len' start )
+    >R 0                             ( addr' len' 0=count ) R: start
+    BEGIN
+        OVER 0>
+    WHILE
+        2 PICK C@ 92 = IF           \ backslash: skip escape pair
+            OVER 2 < IF             \ not enough bytes — malformed
+                2DROP DROP R> DROP 0 0 EXIT
+            THEN
+            >R 2 /STRING R>
+            2 +                      \ count += 2
+        ELSE
+            2 PICK C@ 34 = IF       \ closing "
+                NIP NIP R> SWAP EXIT \ ( start count )
+            THEN
+            >R 1 /STRING R>
+            1+
+        THEN
+    REPEAT
+    2DROP DROP R> DROP 0 0 ;         \ unterminated string
+
+\ JSON-GET-NUMBER ( addr len -- n )
+\   Extract integer value.  Handles optional minus sign.
+VARIABLE _JSON-NUM-NEG
+: JSON-GET-NUMBER  ( addr len -- n )
+    0 _JSON-NUM-NEG !
+    JSON-SKIP-WS
+    DUP 0<= IF 2DROP 0 EXIT THEN
+    OVER C@ 45 = IF
+        -1 _JSON-NUM-NEG !
+        1 /STRING
+    THEN
+    0                                ( addr len accum )
+    BEGIN
+        OVER 0> WHILE
+        2 PICK C@ DUP 48 >= SWAP 57 <= AND
+    WHILE
+        10 *
+        2 PICK C@ 48 - +
+        >R 1 /STRING R>
+    REPEAT THEN
+    NIP NIP
+    _JSON-NUM-NEG @ IF NEGATE THEN ;
+
+\ JSON-SKIP-STRING ( addr len -- addr' len' )
+\   Skip past a JSON string value (addr points at opening ").
+: JSON-SKIP-STRING  ( addr len -- addr' len' )
+    OVER C@ 34 <> IF EXIT THEN
+    1 /STRING                        \ skip opening "
+    BEGIN
+        DUP 0>
+    WHILE
+        OVER C@ 92 = IF             \ backslash escape
+            DUP 2 >= IF
+                2 /STRING
+            ELSE
+                1 /STRING            \ malformed — skip what we can
+            THEN
+        ELSE
+            OVER C@ 34 = IF         \ closing "
+                1 /STRING EXIT
+            THEN
+            1 /STRING
+        THEN
+    REPEAT ;
+
+\ JSON-SKIP-VALUE ( addr len -- addr' len' )
+\   Skip one complete JSON value (string, number, object, array,
+\   boolean, null).
+VARIABLE _JSON-DEPTH
+: JSON-SKIP-VALUE  ( addr len -- addr' len' )
+    JSON-SKIP-WS
+    DUP 0<= IF EXIT THEN
+    OVER C@
+    DUP 34 = IF                      \ " → string
+        DROP JSON-SKIP-STRING EXIT
+    THEN
+    DUP 123 = OVER 91 = OR IF       \ { or [ → nested structure
+        DROP
+        1 _JSON-DEPTH !
+        1 /STRING                    \ skip opening brace/bracket
+        BEGIN
+            DUP 0> _JSON-DEPTH @ 0> AND
+        WHILE
+            OVER C@
+            DUP 34 = IF              \ " inside structure — skip string
+                DROP JSON-SKIP-STRING
+            ELSE DUP 123 = OVER 91 = OR IF
+                DROP 1 _JSON-DEPTH +!
+                1 /STRING
+            ELSE DUP 125 = OVER 93 = OR IF
+                DROP -1 _JSON-DEPTH +!
+                1 /STRING
+            ELSE
+                DROP 1 /STRING
+            THEN THEN THEN
+        REPEAT
+        EXIT
+    THEN
+    DROP
+    \ number, true, false, null — scan to delimiter
+    BEGIN
+        DUP 0>
+    WHILE
+        OVER C@ DUP 44 =            \ ,
+        OVER 125 = OR               \ }
+        OVER 93 = OR                \ ]
+        OVER 32 = OR                \ space
+        OVER 10 = OR                \ LF
+        SWAP 13 = OR                \ CR
+        IF EXIT THEN
+        1 /STRING
+    REPEAT ;
+
+\ ── §1.3  Array Iterator ─────────────────────────────────────────
+
+\ JSON-GET-ARRAY ( jaddr jlen key-addr key-len -- arr-addr arr-len )
+\   Find the array value for key.  Returns pointer inside [ ].
+: JSON-GET-ARRAY  ( jaddr jlen kaddr klen -- aaddr alen )
+    JSON-FIND-KEY
+    DUP 0= IF EXIT THEN
+    JSON-SKIP-WS
+    OVER C@ 91 <> IF 2DROP 0 0 EXIT THEN
+    1 /STRING
+    JSON-SKIP-WS ;
+
+\ JSON-NEXT-ITEM ( addr len -- addr' len' | 0 0 )
+\   Advance to next array element.  Returns 0 0 at end of array.
+: JSON-NEXT-ITEM  ( addr len -- addr' len' | 0 0 )
+    JSON-SKIP-WS
+    DUP 0<= IF 2DROP 0 0 EXIT THEN
+    OVER C@ 93 = IF 2DROP 0 0 EXIT THEN   \ ]
+    OVER C@ 44 = IF 1 /STRING THEN        \ skip ,
+    JSON-SKIP-WS
+    DUP 0<= IF 2DROP 0 0 EXIT THEN
+    OVER C@ 93 = IF 2DROP 0 0 EXIT THEN ;
+
+\ =====================================================================
+\  §1 — End of JSON Parser
+\ =====================================================================
 \
 \  Test at the ok prompt:
 \
-\    123 NUM>STR TYPE             → 123
-\    0 NUM>STR TYPE               → 0
-\    BSK-RESET S" hello" BSK-APPEND BSK-TYPE   → hello
-\    BSK-RESET S" say \"hi\"" JSON-COPY-ESCAPED BSK-TYPE  → say \"hi\"
-\    BSK-NOW TYPE                 → 2025-01-15T12:30:45.000Z  (example)
-\    BSK-RESET S" did:plc:abc" URL-ENCODE BSK-TYPE  → did%3Aplc%3Aabc
-\    BSK-RESET S" id" S" alice" BSK-KV BSK-TYPE     → "id":"alice"
+\  : TEST-JSON1
+\    S\" {\"name\":\"alice\",\"age\":30}"
+\    S" name" JSON-FIND-KEY JSON-GET-STRING TYPE ;
+\  TEST-JSON1                        → alice
+\
+\  : TEST-JSON2
+\    S\" {\"x\":\"hello\",\"y\":42}"
+\    S" y" JSON-FIND-KEY JSON-GET-NUMBER . ;
+\  TEST-JSON2                        → 42
