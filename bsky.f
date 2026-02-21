@@ -745,3 +745,197 @@ VARIABLE BSK-HTTP-STATUS             \ last HTTP status code (200, 401, etc.)
 \ =====================================================================
 \  §2 — End of HTTP POST and Authenticated GET
 \ =====================================================================
+
+\ =====================================================================
+\  §3  Authentication
+\ =====================================================================
+\
+\  Login via com.atproto.server.createSession, store JWTs, refresh.
+\  Uses BSK-POST-JSON / BSK-BUILD-POST + BSK-XRPC-SEND from Stage 2.
+\
+\  createSession request:  {"identifier":"handle","password":"pass"}
+\  createSession response: {"accessJwt":"...","refreshJwt":"...",
+\                           "did":"did:plc:...","handle":"..."}
+\
+\  refreshSession request: POST with empty body, Bearer = refreshJwt
+\  refreshSession response: same as createSession
+
+\ ── §3.1  Login JSON Builder ──────────────────────────────────────
+\
+\  Build the createSession JSON body in BSK-BUF (temporarily),
+\  then copy it aside so BSK-BUILD-POST can reference it.
+
+CREATE _BSK-LOGIN-BUF 512 ALLOT     \ temp buffer for login JSON body
+VARIABLE _BSK-LOGIN-LEN   0 _BSK-LOGIN-LEN !
+
+\ _BSK-BUILD-LOGIN-JSON ( handle-addr handle-len pass-addr pass-len -- )
+\   Builds {"identifier":"<handle>","password":"<pass>"} into
+\   _BSK-LOGIN-BUF.  Uses BSK-BUF as scratch then copies out.
+: _BSK-BUILD-LOGIN-JSON  ( haddr hlen paddr plen -- )
+    2>R 2>R                          \ save pass & handle on rstack
+    BSK-RESET
+    S" {" BSK-APPEND
+    34 BSK-EMIT  S" identifier" BSK-APPEND  34 BSK-EMIT
+    58 BSK-EMIT                      \ :
+    34 BSK-EMIT  2R> JSON-COPY-ESCAPED  34 BSK-EMIT
+    44 BSK-EMIT                      \ ,
+    34 BSK-EMIT  S" password" BSK-APPEND  34 BSK-EMIT
+    58 BSK-EMIT                      \ :
+    34 BSK-EMIT  2R> JSON-COPY-ESCAPED  34 BSK-EMIT
+    S" }" BSK-APPEND
+    \ Copy to _BSK-LOGIN-BUF
+    BSK-BUF _BSK-LOGIN-BUF BSK-LEN @ CMOVE
+    BSK-LEN @ _BSK-LOGIN-LEN ! ;
+
+\ ── §3.2  Session Response Parser ─────────────────────────────────
+\
+\  Extract accessJwt, refreshJwt, did, handle from createSession /
+\  refreshSession response body and store in their buffers.
+
+\ _BSK-EXTRACT-FIELD ( body-addr body-len key-addr key-len
+\                      dst-addr dst-max dst-len-var -- ok? )
+\   Find a JSON string field and copy it into a fixed buffer.
+\   Returns -1 on success, 0 on failure (key not found or too long).
+VARIABLE _EF-DST
+VARIABLE _EF-DMAX
+VARIABLE _EF-DVAR
+
+: _BSK-EXTRACT-FIELD  ( baddr blen kaddr klen dst dmax dlen-var -- ok? )
+    _EF-DVAR !  _EF-DMAX !  _EF-DST !
+    JSON-FIND-KEY                    ( vaddr vlen | 0 0 )
+    DUP 0= IF 2DROP 0 EXIT THEN
+    JSON-GET-STRING                  ( str-addr str-len )
+    DUP 0= IF 2DROP 0 EXIT THEN
+    DUP _EF-DMAX @ > IF 2DROP 0 EXIT THEN
+    \ Copy string to destination buffer
+    DUP _EF-DVAR @ !                \ store length
+    _EF-DST @ SWAP CMOVE            \ CMOVE ( str-addr dst str-len )
+    -1 ;
+
+\ _BSK-PARSE-SESSION ( body-addr body-len -- ok? )
+\   Parse createSession / refreshSession response.
+\   Stores tokens and identity.  Returns -1 on success, 0 on failure.
+: _BSK-PARSE-SESSION  ( baddr blen -- ok? )
+    \ Extract accessJwt
+    2DUP S" accessJwt"
+    BSK-ACCESS-JWT BSK-JWT-MAX BSK-ACCESS-LEN
+    _BSK-EXTRACT-FIELD 0= IF 2DROP 0 EXIT THEN
+    \ Extract refreshJwt
+    2DUP S" refreshJwt"
+    BSK-REFRESH-JWT BSK-JWT-MAX BSK-REFRESH-LEN
+    _BSK-EXTRACT-FIELD 0= IF 2DROP 0 EXIT THEN
+    \ Extract did
+    2DUP S" did"
+    BSK-DID BSK-DID-MAX BSK-DID-LEN
+    _BSK-EXTRACT-FIELD 0= IF 2DROP 0 EXIT THEN
+    \ Extract handle
+    S" handle"
+    BSK-HANDLE BSK-HANDLE-MAX BSK-HANDLE-LEN
+    _BSK-EXTRACT-FIELD ;
+
+\ ── §3.3  Login Command ───────────────────────────────────────────
+\
+\  BSK-LOGIN ( "handle" "password" -- )
+\  User-facing word.  Reads handle and password from the input stream.
+\
+\  Usage:   BSK-LOGIN myname.bsky.social xxxx-xxxx-xxxx-xxxx
+
+\ Temp parse buffers (used only during login)
+CREATE _BSK-LOGIN-HANDLE 128 ALLOT
+VARIABLE _BSK-LOGIN-HLEN   0 _BSK-LOGIN-HLEN !
+CREATE _BSK-LOGIN-PASS 128 ALLOT
+VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
+
+: BSK-LOGIN  ( "handle" "password" -- )
+    BSK-INIT
+    \ Parse handle and password from input stream
+    BL WORD COUNT                    ( addr len )
+    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
+    127 MIN DUP _BSK-LOGIN-HLEN !
+    _BSK-LOGIN-HANDLE SWAP CMOVE
+    BL WORD COUNT                    ( addr len )
+    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
+    127 MIN DUP _BSK-LOGIN-PLEN !
+    _BSK-LOGIN-PASS SWAP CMOVE
+    \ Build login JSON
+    _BSK-LOGIN-HANDLE _BSK-LOGIN-HLEN @
+    _BSK-LOGIN-PASS _BSK-LOGIN-PLEN @
+    _BSK-BUILD-LOGIN-JSON
+    \ Clear password from memory immediately
+    _BSK-LOGIN-PASS 128 0 FILL  0 _BSK-LOGIN-PLEN !
+    \ POST to createSession
+    S" /xrpc/com.atproto.server.createSession"
+    _BSK-LOGIN-BUF _BSK-LOGIN-LEN @
+    BSK-BUILD-POST
+    BSK-XRPC-SEND IF
+        ." bsky: login network error" CR EXIT
+    THEN
+    \ Parse response
+    BSK-PARSE-RESPONSE              ( body-addr body-len status )
+    DUP 200 <> IF
+        ." bsky: login failed (HTTP " . ." )" CR
+        TYPE CR                      \ print error body
+        EXIT
+    THEN
+    DROP                             \ drop status
+    _BSK-PARSE-SESSION 0= IF
+        ." bsky: login failed (parse error)" CR EXIT
+    THEN
+    ." Logged in as " BSK-HANDLE BSK-HANDLE-LEN @ TYPE CR ;
+
+\ ── §3.4  Token Refresh ───────────────────────────────────────────
+\
+\  BSK-REFRESH ( -- )
+\  Refresh the access token using the stored refresh token.
+\  The refresh endpoint uses the refreshJwt as Bearer auth
+\  (not the accessJwt).
+
+: BSK-REFRESH  ( -- )
+    BSK-REFRESH-LEN @ 0= IF
+        ." bsky: no refresh token — login first" CR EXIT
+    THEN
+    \ Build POST with empty body, but we need refreshJwt as auth.
+    \ Temporarily swap refresh into access position:
+    \ 1. Save current access token aside
+    BSK-RESET
+    S" POST /xrpc/com.atproto.server.refreshSession HTTP/1.1" BSK-APPEND
+    _BSK-APPEND-CRLF
+    _BSK-APPEND-HOST
+    \ Manually append auth with refresh token
+    S" Authorization: Bearer " BSK-APPEND
+    BSK-REFRESH-JWT BSK-REFRESH-LEN @ BSK-APPEND
+    _BSK-APPEND-CRLF
+    S" Content-Length: 0" BSK-APPEND  _BSK-APPEND-CRLF
+    _BSK-APPEND-CLOSE
+    _BSK-APPEND-CRLF                \ blank line = end of headers
+    \ Send
+    BSK-XRPC-SEND IF
+        ." bsky: refresh network error" CR EXIT
+    THEN
+    \ Parse response
+    BSK-PARSE-RESPONSE              ( body-addr body-len status )
+    DUP 200 <> IF
+        ." bsky: refresh failed (HTTP " . ." )" CR
+        TYPE CR EXIT
+    THEN
+    DROP
+    _BSK-PARSE-SESSION 0= IF
+        ." bsky: refresh failed (parse error)" CR EXIT
+    THEN
+    ." bsky: tokens refreshed" CR ;
+
+\ ── §3.5  Session Info ────────────────────────────────────────────
+
+\ BSK-WHO ( -- )  Display current session information
+: BSK-WHO  ( -- )
+    BSK-ACCESS-LEN @ 0= IF
+        ." Not logged in" CR EXIT
+    THEN
+    ." Handle: " BSK-HANDLE BSK-HANDLE-LEN @ TYPE CR
+    ." DID:    " BSK-DID BSK-DID-LEN @ TYPE CR
+    ." Access: " BSK-ACCESS-LEN @ . ." bytes" CR
+    ." Refresh: " BSK-REFRESH-LEN @ . ." bytes" CR ;
+
+\ =====================================================================
+\  §3 — End of Authentication
+\ =====================================================================

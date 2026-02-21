@@ -639,6 +639,110 @@ def test_stage2():
           "-1 ")
 
 
+def test_stage3():
+    """Stage 3: Authentication — login JSON builder, session parser, commands."""
+    print("Stage 3: Authentication")
+    print("-" * 40)
+
+    # §3.1 — Login JSON builder
+    check("Login JSON basic structure",
+          ['BSK-INIT',
+           ': _T S" alice.bsky.social" S" pass123"',
+           '  _BSK-BUILD-LOGIN-JSON',
+           '  _BSK-LOGIN-BUF _BSK-LOGIN-LEN @ TYPE ; _T'],
+          None,
+          lambda out: '"identifier":"alice.bsky.social"' in out
+                      and '"password":"pass123"' in out)
+
+    check("Login JSON is valid shape",
+          ['BSK-INIT',
+           ': _T S" user" S" pw"',
+           '  _BSK-BUILD-LOGIN-JSON',
+           '  _BSK-LOGIN-BUF _BSK-LOGIN-LEN @ TYPE ; _T'],
+          '{"identifier":"user","password":"pw"}')
+
+    check("Login JSON with special chars",
+          ['BSK-INIT'] +
+          jstr('test"user') +
+          [': _T TA S" pw"',
+           '  _BSK-BUILD-LOGIN-JSON',
+           '  _BSK-LOGIN-BUF _BSK-LOGIN-LEN @ TYPE ; _T'],
+          None,
+          lambda out: r'test\"user' in out)
+
+    # §3.2 — Session parser
+    # Build a fake createSession response JSON and parse it
+    check("Parse session extracts accessJwt",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"atok","refreshJwt":"rtok","did":"did:plc:abc","handle":"me.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION . ; _T'],
+          "-1 ")  # -1 = success
+
+    check("Parse session stores access token",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"myaccess","refreshJwt":"myrefresh","did":"did:plc:x","handle":"h.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP',
+           '  BSK-ACCESS-JWT BSK-ACCESS-LEN @ TYPE ; _T'],
+          "myaccess")
+
+    check("Parse session stores refresh token",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"a","refreshJwt":"myrefresh","did":"did:plc:x","handle":"h.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP',
+           '  BSK-REFRESH-JWT BSK-REFRESH-LEN @ TYPE ; _T'],
+          "myrefresh")
+
+    check("Parse session stores DID",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"a","refreshJwt":"r","did":"did:plc:abc123","handle":"h.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP',
+           '  BSK-DID BSK-DID-LEN @ TYPE ; _T'],
+          "did:plc:abc123")
+
+    check("Parse session stores handle",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"a","refreshJwt":"r","did":"did:plc:x","handle":"alice.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP',
+           '  BSK-HANDLE BSK-HANDLE-LEN @ TYPE ; _T'],
+          "alice.bsky.social")
+
+    check("Parse session fails on missing key",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"a","did":"did:plc:x","handle":"h"}') +
+          [': _T TA _BSK-PARSE-SESSION . ; _T'],
+          "0 ")  # 0 = failure (missing refreshJwt)
+
+    check("Parse session access token length",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"shortjwt","refreshJwt":"r","did":"did:plc:x","handle":"h"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP',
+           '  BSK-ACCESS-LEN @ . ; _T'],
+          "8 ")  # len("shortjwt") = 8
+
+    # §3.3 — BSK-LOGIN word exists (can't test without network)
+    check("BSK-LOGIN word exists",
+          ["' BSK-LOGIN 0> ."],
+          "-1 ")
+
+    # §3.4 — BSK-REFRESH word exists
+    check("BSK-REFRESH word exists",
+          ["' BSK-REFRESH 0> ."],
+          "-1 ")
+
+    # §3.5 — BSK-WHO
+    check("BSK-WHO no session",
+          ['BSK-INIT',
+           ': _T BSK-WHO ; _T'],
+          "Not logged in")
+
+    check("BSK-WHO with session",
+          ['BSK-INIT'] +
+          jstr('{"accessJwt":"atok","refreshJwt":"rtok","did":"did:plc:test","handle":"me.bsky.social"}') +
+          [': _T TA _BSK-PARSE-SESSION DROP BSK-WHO ; _T'],
+          None,
+          lambda out: 'me.bsky.social' in out and 'did:plc:test' in out)
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -674,6 +778,8 @@ def main():
     test_stage1()
     print()
     test_stage2()
+    print()
+    test_stage3()
 
     print()
     print("=" * 60)
