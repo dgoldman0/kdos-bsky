@@ -941,3 +941,278 @@ VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
 \ =====================================================================
 \  §3 — End of Authentication
 \ =====================================================================
+
+\ =====================================================================
+\  §4  Read-Only Features
+\ =====================================================================
+\
+\  View timeline, profiles, and notifications.
+\  All words require a valid session (BSK-LOGIN first).
+\  Uses BSK-GET from Stage 2 and JSON parser from Stage 1.
+
+\ ── §4.0  Display Helpers ─────────────────────────────────────────
+\
+\  Truncate and word-wrap text for 80-column display.
+
+\ _BSK-TYPE-TRUNC ( addr len maxlen -- )
+\   Print up to maxlen characters, add "..." if truncated.
+: _BSK-TYPE-TRUNC  ( addr len maxlen -- )
+    2DUP > IF
+        NIP                         \ drop len; ( addr maxlen )
+        3 - TYPE ." ..."
+    ELSE
+        DROP TYPE
+    THEN ;
+
+\ ── §4.1  Timeline ────────────────────────────────────────────────
+\
+\  BSK-TL ( -- )  Fetch and display recent timeline posts (5 items).
+\
+\  Endpoint: GET /xrpc/app.bsky.feed.getTimeline?limit=5
+\  Response: {"cursor":"...","feed":[{"post":{"author":{"handle":"...","displayName":"..."},"record":{"text":"..."},...},...},...]}
+\
+\  Each feed item has a deep "post" object.  We use JSON-FIND-KEY
+\  to navigate into nested objects since it scans forward.
+
+\ Cursor storage for pagination
+CREATE BSK-TL-CURSOR 128 ALLOT
+VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
+
+\ _BSK-TL-PRINT-POST ( item-addr item-len -- )
+\   Print one timeline post entry (feed item).
+\   Expects addr/len to point at the start of a feed item object.
+: _BSK-TL-PRINT-POST  ( addr len -- )
+    \ Find post object first
+    2DUP S" post" JSON-FIND-KEY     ( addr len post-val-addr post-val-len )
+    DUP 0= IF 2DROP 2DROP EXIT THEN
+    \ Now within "post" value, find author.handle
+    2DUP S" handle" JSON-FIND-KEY   ( addr len pvaddr pvlen handle-val-addr handle-val-len )
+    DUP 0> IF
+        JSON-GET-STRING             ( addr len pvaddr pvlen handle-saddr handle-slen )
+        ." @" 76 _BSK-TYPE-TRUNC
+    THEN
+    2DROP                           \ drop handle result
+    \ Find displayName inside the post scope
+    2DUP S" displayName" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING
+        DUP 0> IF
+            ."  (" 60 _BSK-TYPE-TRUNC ." )"
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    \ Find record.text within the post scope
+    2DUP S" text" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING
+        DUP 0> IF
+            ."   " 200 _BSK-TYPE-TRUNC CR
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    2DROP                           \ drop remaining post scope
+    ." ---" CR ;
+
+\ _BSK-TL-PATH ( -- addr len )
+\   Build the timeline request path with limit parameter.
+\   If a cursor is stored, appends &cursor=<cursor>.
+: _BSK-TL-PATH  ( -- addr len )
+    BSK-RESET
+    S" /xrpc/app.bsky.feed.getTimeline?limit=5" BSK-APPEND
+    BSK-TL-CURSOR-LEN @ 0> IF
+        S" &cursor=" BSK-APPEND
+        BSK-TL-CURSOR BSK-TL-CURSOR-LEN @ URL-ENCODE
+    THEN
+    BSK-BUF BSK-LEN @ ;
+
+\ BSK-TL ( -- )   Display recent timeline posts
+: BSK-TL  ( -- )
+    BSK-ACCESS-LEN @ 0= IF ." bsky: login first" CR EXIT THEN
+    _BSK-TL-PATH BSK-GET           ( body-addr body-len )
+    DUP 0= IF 2DROP ." bsky: timeline fetch failed" CR EXIT THEN
+    BSK-HTTP-STATUS @ 200 <> IF
+        ." bsky: timeline error (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+        2DROP EXIT
+    THEN
+    \ Store cursor for pagination
+    2DUP S" cursor" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING
+        DUP 128 <= IF
+            DUP BSK-TL-CURSOR-LEN !
+            BSK-TL-CURSOR SWAP CMOVE
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Iterate feed array
+    2DUP S" feed" JSON-FIND-KEY     ( body blen feed-val-addr feed-val-len )
+    DUP 0= IF 2DROP 2DROP ." bsky: no feed in response" CR EXIT THEN
+    \ Skip into the array
+    JSON-SKIP-WS
+    OVER C@ 91 <> IF 2DROP 2DROP ." bsky: feed not array" CR EXIT THEN
+    1 /STRING JSON-SKIP-WS          \ skip [ and whitespace
+    \ Iterate items
+    BEGIN
+        DUP 0> IF
+            OVER C@ 93 <>          \ not ]
+        ELSE 0 THEN
+    WHILE
+        2DUP _BSK-TL-PRINT-POST
+        JSON-SKIP-VALUE             \ skip past this item
+        JSON-SKIP-WS
+        DUP 0> IF
+            OVER C@ 44 = IF 1 /STRING JSON-SKIP-WS THEN
+        THEN
+    REPEAT
+    2DROP 2DROP ;
+
+\ BSK-TL-NEXT ( -- )   Show next page of timeline
+: BSK-TL-NEXT  ( -- )
+    BSK-TL-CURSOR-LEN @ 0= IF
+        ." bsky: no more posts (no cursor)" CR EXIT
+    THEN
+    BSK-TL ;
+
+\ ── §4.2  Profile Viewer ─────────────────────────────────────────
+\
+\  BSK-PROFILE ( "handle" -- )  View a user's profile.
+\
+\  Endpoint: GET /xrpc/app.bsky.actor.getProfile?actor=<handle>
+\  Response: {"did":"...","handle":"...","displayName":"...",
+\             "description":"...","followersCount":N,
+\             "followsCount":N,"postsCount":N,...}
+
+\ _BSK-PROFILE-PATH ( actor-addr actor-len -- path-addr path-len )
+\   Build profile request path with URL-encoded actor parameter.
+: _BSK-PROFILE-PATH  ( addr len -- path-addr path-len )
+    BSK-RESET
+    S" /xrpc/app.bsky.actor.getProfile?actor=" BSK-APPEND
+    URL-ENCODE
+    BSK-BUF BSK-LEN @ ;
+
+: BSK-PROFILE  ( "handle" -- )
+    BSK-ACCESS-LEN @ 0= IF ." bsky: login first" CR EXIT THEN
+    BL WORD COUNT                   ( addr len )
+    DUP 0= IF 2DROP ." Usage: BSK-PROFILE handle" CR EXIT THEN
+    _BSK-PROFILE-PATH BSK-GET      ( body-addr body-len )
+    DUP 0= IF 2DROP ." bsky: profile fetch failed" CR EXIT THEN
+    BSK-HTTP-STATUS @ 200 <> IF
+        ." bsky: profile error (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+        2DROP EXIT
+    THEN
+    \ Display profile info
+    2DUP S" displayName" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF 64 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF ." @" 64 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" description" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF 200 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" followersCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." followers  " ELSE 2DROP THEN
+    2DUP S" followsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." following  " ELSE 2DROP THEN
+    2DUP S" postsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." posts" ELSE 2DROP THEN
+    CR
+    2DROP ;
+
+\ _BSK-PROFILE-WITH ( actor-addr actor-len -- )
+\   Stack-based profile viewer (no input stream parsing).
+: _BSK-PROFILE-WITH  ( addr len -- )
+    BSK-ACCESS-LEN @ 0= IF 2DROP ." bsky: login first" CR EXIT THEN
+    _BSK-PROFILE-PATH BSK-GET      ( body-addr body-len )
+    DUP 0= IF 2DROP ." bsky: profile fetch failed" CR EXIT THEN
+    BSK-HTTP-STATUS @ 200 <> IF
+        ." bsky: profile error (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+        2DROP EXIT
+    THEN
+    2DUP S" displayName" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF 64 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF ." @" 64 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" description" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-STRING DUP 0> IF 200 _BSK-TYPE-TRUNC ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR
+    2DUP S" followersCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." followers  " ELSE 2DROP THEN
+    2DUP S" followsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." following  " ELSE 2DROP THEN
+    2DUP S" postsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER . ." posts" ELSE 2DROP THEN
+    CR
+    2DROP ;
+
+\ ── §4.3  Notifications ──────────────────────────────────────────
+\
+\  BSK-NOTIF ( -- )  List recent notifications (10 items).
+\
+\  Endpoint: GET /xrpc/app.bsky.notification.listNotifications?limit=10
+\  Response: {"cursor":"...","notifications":[
+\    {"reason":"like"|"reply"|"follow"|"mention"|"repost"|"quote",
+\     "author":{"handle":"...","displayName":"..."},
+\     ...},...]}
+
+\ _BSK-NOTIF-PRINT ( item-addr item-len -- )
+\   Print one notification entry.
+: _BSK-NOTIF-PRINT  ( addr len -- )
+    \ Extract reason
+    2DUP S" reason" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING             ( addr len reason-addr reason-len )
+        DUP 0> IF
+            20 _BSK-TYPE-TRUNC
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    ."  from "
+    \ Extract author.handle
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING
+        DUP 0> IF
+            ." @" 40 _BSK-TYPE-TRUNC
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    CR ;
+
+: BSK-NOTIF  ( -- )
+    BSK-ACCESS-LEN @ 0= IF ." bsky: login first" CR EXIT THEN
+    BSK-RESET
+    S" /xrpc/app.bsky.notification.listNotifications?limit=10" BSK-APPEND
+    BSK-BUF BSK-LEN @ BSK-GET      ( body-addr body-len )
+    DUP 0= IF 2DROP ." bsky: notif fetch failed" CR EXIT THEN
+    BSK-HTTP-STATUS @ 200 <> IF
+        ." bsky: notif error (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+        2DROP EXIT
+    THEN
+    \ Iterate notifications array
+    2DUP S" notifications" JSON-FIND-KEY
+    DUP 0= IF 2DROP 2DROP ." bsky: no notifications in response" CR EXIT THEN
+    JSON-SKIP-WS
+    OVER C@ 91 <> IF 2DROP 2DROP ." bsky: notifications not array" CR EXIT THEN
+    1 /STRING JSON-SKIP-WS          \ skip [ and whitespace
+    BEGIN
+        DUP 0> IF
+            OVER C@ 93 <>          \ not ]
+        ELSE 0 THEN
+    WHILE
+        2DUP _BSK-NOTIF-PRINT
+        JSON-SKIP-VALUE
+        JSON-SKIP-WS
+        DUP 0> IF
+            OVER C@ 44 = IF 1 /STRING JSON-SKIP-WS THEN
+        THEN
+    REPEAT
+    2DROP 2DROP ;
+
+\ =====================================================================
+\  §4 — End of Read-Only Features
+\ =====================================================================

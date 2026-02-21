@@ -743,6 +743,123 @@ def test_stage3():
           lambda out: 'me.bsky.social' in out and 'did:plc:test' in out)
 
 
+def test_stage4():
+    """Stage 4: Read-Only Features — timeline, profile, notifications."""
+    print("Stage 4: Read-Only Features")
+    print("-" * 40)
+
+    # §4.0 — Display helpers
+    check("Type-trunc short string",
+          [': _T S" hello" 10 _BSK-TYPE-TRUNC ; _T'],
+          "hello")
+
+    check("Type-trunc at limit",
+          [': _T S" hello" 5 _BSK-TYPE-TRUNC ; _T'],
+          "hello")
+
+    check("Type-trunc over limit",
+          [': _T S" hello world" 8 _BSK-TYPE-TRUNC ; _T'],
+          "hello...")
+
+    # §4.1 — Timeline path builder
+    check("TL path without cursor",
+          ['BSK-INIT',
+           ': _T _BSK-TL-PATH TYPE ; _T'],
+          "/xrpc/app.bsky.feed.getTimeline?limit=5")
+
+    check("TL path with cursor",
+          ['BSK-INIT'] +
+          jstr('abc123') +
+          [': _T TA BSK-TL-CURSOR SWAP DUP BSK-TL-CURSOR-LEN ! CMOVE',
+           '  _BSK-TL-PATH TYPE ; _T'],
+          "/xrpc/app.bsky.feed.getTimeline?limit=5&cursor=abc123")
+
+    # §4.1 — Timeline post printer
+    # Simulate a single feed item with nested post/author/record
+    check("TL print post extracts handle",
+          ['BSK-INIT'] +
+          jstr('{"post":{"author":{"handle":"alice.bsky.social","displayName":"Alice"},"record":{"text":"Hello world"}}}') +
+          [': _T TA _BSK-TL-PRINT-POST ; _T'],
+          None,
+          lambda out: '@alice.bsky.social' in out)
+
+    check("TL print post extracts displayName",
+          ['BSK-INIT'] +
+          jstr('{"post":{"author":{"handle":"alice.bsky.social","displayName":"Alice"},"record":{"text":"Hello world"}}}') +
+          [': _T TA _BSK-TL-PRINT-POST ; _T'],
+          None,
+          lambda out: '(Alice)' in out)
+
+    check("TL print post extracts text",
+          ['BSK-INIT'] +
+          jstr('{"post":{"author":{"handle":"bob.bsky.social","displayName":"Bob"},"record":{"text":"Testing 123"}}}') +
+          [': _T TA _BSK-TL-PRINT-POST ; _T'],
+          "Testing 123")
+
+    check("TL print post shows separator",
+          ['BSK-INIT'] +
+          jstr('{"post":{"author":{"handle":"x.bsky.social","displayName":"X"},"record":{"text":"hi"}}}') +
+          [': _T TA _BSK-TL-PRINT-POST ; _T'],
+          "---")
+
+    # §4.2 — Profile path builder
+    check("Profile path simple handle",
+          ['BSK-INIT',
+           ': _T S" alice.bsky.social" _BSK-PROFILE-PATH TYPE ; _T'],
+          "/xrpc/app.bsky.actor.getProfile?actor=alice.bsky.social")
+
+    check("Profile path DID encoding",
+          ['BSK-INIT',
+           ': _T S" did:plc:abc" _BSK-PROFILE-PATH TYPE ; _T'],
+          "/xrpc/app.bsky.actor.getProfile?actor=did%3Aplc%3Aabc")
+
+    # §4.2 — Word existence checks for network-dependent words
+    check("BSK-PROFILE word exists",
+          ["' BSK-PROFILE 0> ."],
+          "-1 ")
+
+    check("BSK-TL word exists",
+          ["' BSK-TL 0> ."],
+          "-1 ")
+
+    check("BSK-TL-NEXT word exists",
+          ["' BSK-TL-NEXT 0> ."],
+          "-1 ")
+
+    # §4.3 — Notification printer
+    check("Notif print extracts reason",
+          ['BSK-INIT'] +
+          jstr('{"reason":"like","author":{"handle":"carol.bsky.social","displayName":"Carol"}}') +
+          [': _T TA _BSK-NOTIF-PRINT ; _T'],
+          "like")
+
+    check("Notif print extracts author handle",
+          ['BSK-INIT'] +
+          jstr('{"reason":"follow","author":{"handle":"dan.bsky.social","displayName":"Dan"}}') +
+          [': _T TA _BSK-NOTIF-PRINT ; _T'],
+          "@dan.bsky.social")
+
+    check("Notif print shows from",
+          ['BSK-INIT'] +
+          jstr('{"reason":"reply","author":{"handle":"eve.bsky.social"}}') +
+          [': _T TA _BSK-NOTIF-PRINT ; _T'],
+          " from ")
+
+    check("BSK-NOTIF word exists",
+          ["' BSK-NOTIF 0> ."],
+          "-1 ")
+
+    check("BSK-TL requires login",
+          ['BSK-INIT',
+           ': _T BSK-TL ; _T'],
+          "login first")
+
+    check("BSK-NOTIF requires login",
+          ['BSK-INIT',
+           ': _T BSK-NOTIF ; _T'],
+          "login first")
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -780,6 +897,8 @@ def main():
     test_stage2()
     print()
     test_stage3()
+    print()
+    test_stage4()
 
     print()
     print("=" * 60)
