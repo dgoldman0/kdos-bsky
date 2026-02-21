@@ -640,7 +640,9 @@ VARIABLE _BSK-EMPTY                  \ consecutive empty recv counter
     \ Set SNI hostname
     BSK-HOST-LEN 63 MIN DUP TLS-SNI-LEN !
     BSK-HOST TLS-SNI-HOST ROT CMOVE
-    BSK-SERVER-IP @ 443 12345 TLS-CONNECT ;
+    \ Random ephemeral port 49152-65535 to avoid collisions
+    RANDOM32 16383 AND 49152 +
+    BSK-SERVER-IP @ 443 ROT TLS-CONNECT ;
 
 \ _BSK-RECV-LOOP ( ctx -- )  Receive response into HBW recv buffer
 : _BSK-RECV-LOOP  ( ctx -- )
