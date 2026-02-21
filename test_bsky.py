@@ -890,6 +890,143 @@ def test_stage4():
           lambda out: '5 3547' in out or '5 3547 ' in out)
 
 
+def test_stage5():
+    """Stage 5: Write Features — post, reply, like, repost."""
+    print("Stage 5: Write Features")
+    print("-" * 40)
+
+    # Fake DID for testing: did:plc:test123
+    did_setup = (
+        jstr('did:plc:test123') +
+        [': _DID-SET TA BSK-DID SWAP DUP BSK-DID-LEN ! CMOVE ;',
+         '_DID-SET']
+    )
+
+    # §5.1 — JSON builder helpers
+    check("_BSK-QK quoted key",
+          ['BSK-RESET',
+           ': _T S" name" _BSK-QK BSK-TYPE ; _T'],
+          '"name":')
+
+    check("_BSK-QV quoted value",
+          ['BSK-RESET',
+           ': _T S" hello" _BSK-QV BSK-TYPE ; _T'],
+          '"hello"')
+
+    check("_BSK-QV-ESC escapes quotes",
+          ['BSK-RESET'] +
+          jstr('say "hi"') +
+          [': _T TA _BSK-QV-ESC BSK-TYPE ; _T'],
+          r'"say \"hi\""')
+
+    check("_BSK-CR-OPEN builds record prefix",
+          did_setup +
+          [': _T S" app.bsky.feed.post" _BSK-CR-OPEN BSK-TYPE ; _T'],
+          None,
+          lambda out: '"repo":"did:plc:test123"' in out
+                      and '"collection":"app.bsky.feed.post"' in out
+                      and '"$type":"app.bsky.feed.post"' in out)
+
+    check("_BSK-CREATED-AT appends timestamp key",
+          ['BSK-RESET',
+           ': _T _BSK-CREATED-AT BSK-TYPE ; _T'],
+          '"createdAt":"')
+
+    check("_BSK-SUBJECT builds subject JSON",
+          ['BSK-RESET',
+           'CREATE _U 256 ALLOT  VARIABLE _UL',
+           'CREATE _C 256 ALLOT  VARIABLE _CL'] +
+          jstr('at://did:plc:x/app.bsky.feed.post/abc') +
+          ['TA DUP _UL !  _U SWAP CMOVE'] +
+          jstr('bafydef') +
+          ['TA DUP _CL !  _C SWAP CMOVE',
+           ': _T _U _UL @ _C _CL @ _BSK-SUBJECT BSK-TYPE ; _T'],
+          None,
+          lambda out: '"subject":{' in out
+                      and '"uri":"at://did:plc:x/app.bsky.feed.post/abc"' in out
+                      and '"cid":"bafydef"' in out)
+
+    # §5.2 — BSK-POST JSON body
+    check("BSK-POST builds correct JSON",
+          did_setup +
+          [': _T S" app.bsky.feed.post" _BSK-CR-OPEN',
+           '  S" text" _BSK-QK',
+           '  S" Hello from Megapad!" _BSK-QV-ESC',
+           '  _BSK-COMMA _BSK-CREATED-AT _BSK-CR-CLOSE',
+           '  BSK-TYPE ; _T'],
+          None,
+          lambda out: ('"repo":"did:plc:test123"' in out
+                      and '"text":"Hello from Megapad!"' in out
+                      and '"createdAt":"' in out
+                      and '}}' in out))
+
+    # §5.4 — BSK-LIKE JSON body
+    check("BSK-LIKE builds correct JSON",
+          did_setup +
+          ['CREATE _U2 256 ALLOT  VARIABLE _U2L',
+           'CREATE _C2 256 ALLOT  VARIABLE _C2L'] +
+          jstr('at://did:plc:x/app.bsky.feed.post/abc') +
+          ['TA DUP _U2L !  _U2 SWAP CMOVE'] +
+          jstr('bafylike') +
+          ['TA DUP _C2L !  _C2 SWAP CMOVE',
+           ': _T',
+           '  S" app.bsky.feed.like" _BSK-CR-OPEN',
+           '  _U2 _U2L @ _C2 _C2L @ _BSK-SUBJECT',
+           '  _BSK-COMMA _BSK-CREATED-AT _BSK-CR-CLOSE',
+           '  BSK-TYPE ; _T'],
+          None,
+          lambda out: ('"collection":"app.bsky.feed.like"' in out
+                      and '"uri":"at://did:plc:x/app.bsky.feed.post/abc"' in out
+                      and '"cid":"bafylike"' in out))
+
+    # §5.5 — BSK-REPOST JSON body
+    check("BSK-REPOST builds correct JSON",
+          did_setup +
+          ['CREATE _U3 256 ALLOT  VARIABLE _U3L',
+           'CREATE _C3 256 ALLOT  VARIABLE _C3L'] +
+          jstr('at://did:plc:y/app.bsky.feed.post/xyz') +
+          ['TA DUP _U3L !  _U3 SWAP CMOVE'] +
+          jstr('bafyrepost') +
+          ['TA DUP _C3L !  _C3 SWAP CMOVE',
+           ': _T',
+           '  S" app.bsky.feed.repost" _BSK-CR-OPEN',
+           '  _U3 _U3L @ _C3 _C3L @ _BSK-SUBJECT',
+           '  _BSK-COMMA _BSK-CREATED-AT _BSK-CR-CLOSE',
+           '  BSK-TYPE ; _T'],
+          None,
+          lambda out: ('"collection":"app.bsky.feed.repost"' in out
+                      and '"uri":"at://did:plc:y/app.bsky.feed.post/xyz"' in out))
+
+    # §5 — Word existence checks
+    check("BSK-POST word exists",
+          ["' BSK-POST 0> ."],
+          "-1 ")
+
+    check("BSK-REPLY word exists",
+          ["' BSK-REPLY 0> ."],
+          "-1 ")
+
+    check("BSK-LIKE word exists",
+          ["' BSK-LIKE 0> ."],
+          "-1 ")
+
+    check("BSK-REPOST word exists",
+          ["' BSK-REPOST 0> ."],
+          "-1 ")
+
+    # §5.2 — BSK-POST requires login
+    check("BSK-POST requires login",
+          ['BSK-INIT',
+           ': _T S" test" BSK-POST ; _T'],
+          "login first")
+
+    # §5 — _BSK-STAGE-BODY copies buffer
+    check("_BSK-STAGE-BODY copies BSK-BUF",
+          ['BSK-RESET S" hello" BSK-APPEND',
+           ': _T _BSK-STAGE-BODY _BSK-POST-BUF _BSK-POST-LEN @ TYPE ; _T'],
+          "hello")
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -929,6 +1066,8 @@ def main():
     test_stage3()
     print()
     test_stage4()
+    print()
+    test_stage5()
 
     print()
     print("=" * 60)

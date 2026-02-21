@@ -428,7 +428,7 @@ def main():
         buf.clear()
         feed_lines(sys_obj, buf, [
             ': _STAGE4-GET',
-            '  S" /xrpc/app.bsky.feed.getTimeline?limit=1" BSK-GET',
+            '  S" /xrpc/app.bsky.feed.getTimeline?limit=3" BSK-GET',
             '  DUP 0> IF',
             '    ." [TL-OK] len=" DUP . ." status=" BSK-HTTP-STATUS @ . CR',
             '    2DROP',

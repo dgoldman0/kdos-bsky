@@ -635,6 +635,7 @@ VARIABLE _BSK-BODY-LEN
 
 VARIABLE _BSK-CTX                    \ current TLS context
 VARIABLE _BSK-EMPTY                  \ consecutive empty recv counter
+VARIABLE _BSK-RECV-STOP             \ flag: stop recv loop
 
 \ _BSK-TLS-OPEN ( -- ctx | 0 )  TLS connect to cached server IP
 : _BSK-TLS-OPEN  ( -- ctx | 0 )
@@ -645,29 +646,40 @@ VARIABLE _BSK-EMPTY                  \ consecutive empty recv counter
     RANDOM32 16383 AND 49152 +
     BSK-SERVER-IP @ 443 ROT TLS-CONNECT ;
 
-\ _BSK-RECV-LOOP ( ctx -- )  Receive response into HBW recv buffer
+\ Recv-loop helpers — split to stay within KDOS compiler limits.
+\ Each helper handles one TLS-RECV outcome with at most 1 IF.
+
+: _BSK-RECV-ONE  ( -- n )
+    _BSK-CTX @
+    BSK-RECV-BUF @ BSK-RECV-LEN @ +
+    BSK-RECV-MAX BSK-RECV-LEN @ -
+    TLS-RECV ;
+
+: _BSK-RECV-GOT  ( n -- )
+    BSK-RECV-LEN +!   0 _BSK-EMPTY ! ;
+
+: _BSK-RECV-ZERO  ( -- )
+    BSK-RECV-LEN @ 0= IF EXIT THEN
+    _BSK-EMPTY @ 1+ DUP _BSK-EMPTY !
+    10 >= IF TRUE _BSK-RECV-STOP ! THEN ;
+
+: _BSK-RECV-ERR  ( -- )
+    TRUE _BSK-RECV-STOP ! ;
+
+: _BSK-RECV-HANDLE  ( n -- )
+    DUP 0> IF _BSK-RECV-GOT EXIT THEN
+    DUP -1 = IF DROP _BSK-RECV-ERR EXIT THEN
+    DROP _BSK-RECV-ZERO ;
+
+\ _BSK-RECV-LOOP ( ctx -- )  Receive response into recv buffer
 : _BSK-RECV-LOOP  ( ctx -- )
     _BSK-CTX !
-    0 BSK-RECV-LEN !  0 _BSK-EMPTY !
+    0 BSK-RECV-LEN !  0 _BSK-EMPTY !  FALSE _BSK-RECV-STOP !
     500 0 DO
         TCP-POLL NET-IDLE
         BSK-RECV-LEN @ BSK-RECV-MAX >= IF LEAVE THEN
-        _BSK-CTX @
-        BSK-RECV-BUF @ BSK-RECV-LEN @ +
-        BSK-RECV-MAX BSK-RECV-LEN @ -
-        TLS-RECV
-        DUP 0> IF
-            BSK-RECV-LEN +!
-            0 _BSK-EMPTY !
-        ELSE DUP -1 = IF
-            DROP ." bsky: TLS error" CR LEAVE
-        ELSE
-            DROP
-            BSK-RECV-LEN @ 0> IF
-                _BSK-EMPTY @ 1+ DUP _BSK-EMPTY !
-                10 >= IF LEAVE THEN
-            THEN
-        THEN THEN
+        _BSK-RECV-STOP @ IF LEAVE THEN
+        _BSK-RECV-ONE _BSK-RECV-HANDLE
     LOOP ;
 
 \ BSK-XRPC-SEND ( -- ior )
@@ -1338,4 +1350,196 @@ VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
 
 \ =====================================================================
 \  §4 — End of Read-Only Features
+\ =====================================================================
+
+\ =====================================================================
+\  §5  Write Features
+\ =====================================================================
+\
+\  BSK-POST   — post a new skeet
+\  BSK-REPLY  — reply to a post
+\  BSK-LIKE   — like a post
+\  BSK-REPOST — repost
+\
+\  All four use POST /xrpc/com.atproto.repo.createRecord with
+\  different collection and record schemas.
+
+\ ── §5.1  JSON Body Builder ───────────────────────────────────────
+\
+\  Staging buffer: JSON body is built in BSK-BUF, then copied here
+\  before BSK-BUILD-POST overwrites BSK-BUF with HTTP headers.
+
+CREATE _BSK-POST-BUF 2048 ALLOT
+VARIABLE _BSK-POST-LEN   0 _BSK-POST-LEN !
+
+\ _BSK-STAGE-BODY ( -- )  Copy BSK-BUF → _BSK-POST-BUF
+: _BSK-STAGE-BODY  ( -- )
+    BSK-LEN @ 2048 MIN DUP _BSK-POST-LEN !
+    BSK-BUF _BSK-POST-BUF ROT CMOVE ;
+
+\ _BSK-QK ( addr len -- )  Append "key":  (quoted key + colon)
+: _BSK-QK  ( addr len -- )
+    34 BSK-EMIT  BSK-APPEND  34 BSK-EMIT  58 BSK-EMIT ;
+
+\ _BSK-QV ( addr len -- )  Append "value" (quoted value)
+: _BSK-QV  ( addr len -- )
+    34 BSK-EMIT  BSK-APPEND  34 BSK-EMIT ;
+
+\ _BSK-QV-ESC ( addr len -- )  Append "value" with JSON escaping
+: _BSK-QV-ESC  ( addr len -- )
+    34 BSK-EMIT  JSON-COPY-ESCAPED  34 BSK-EMIT ;
+
+\ _BSK-COMMA ( -- )  Append comma
+: _BSK-COMMA  ( -- )  44 BSK-EMIT ;
+
+\ _BSK-CR-OPEN ( collection-addr collection-len -- )
+\   Begin a createRecord JSON body with common fields.
+\   Emits: {"repo":"<DID>","collection":"<col>","record":{"$type":"<col>",
+: _BSK-CR-OPEN  ( caddr clen -- )
+    BSK-RESET
+    123 BSK-EMIT                      \ {
+    S" repo" _BSK-QK
+    BSK-DID BSK-DID-LEN @ _BSK-QV
+    _BSK-COMMA
+    S" collection" _BSK-QK
+    2DUP _BSK-QV
+    _BSK-COMMA
+    S" record" _BSK-QK
+    123 BSK-EMIT                      \ {
+    S" $type" _BSK-QK
+    _BSK-QV
+    _BSK-COMMA ;
+
+\ _BSK-CREATED-AT ( -- )  Append "createdAt":"<ISO8601>"
+: _BSK-CREATED-AT  ( -- )
+    S" createdAt" _BSK-QK
+    BSK-NOW _BSK-QV ;
+
+\ _BSK-CR-CLOSE ( -- )  Close record and outer braces: }}
+: _BSK-CR-CLOSE  ( -- )
+    125 BSK-EMIT  125 BSK-EMIT ;  \ }}
+
+\ _BSK-SUBJECT ( uri-addr uri-len cid-addr cid-len -- )
+\   Append "subject":{"uri":"...","cid":"..."}
+: _BSK-SUBJECT  ( uaddr ulen caddr clen -- )
+    2>R
+    S" subject" _BSK-QK
+    123 BSK-EMIT
+    S" uri" _BSK-QK  _BSK-QV  _BSK-COMMA
+    S" cid" _BSK-QK  2R> _BSK-QV
+    125 BSK-EMIT ;
+
+\ _BSK-DO-CREATE ( -- ok? )  Stage body, POST, check response.
+: _BSK-DO-CREATE  ( -- ok? )
+    BSK-ACCESS-LEN @ 0= IF
+        ." bsky: login first" CR 0 EXIT
+    THEN
+    _BSK-STAGE-BODY
+    S" /xrpc/com.atproto.repo.createRecord"
+    _BSK-POST-BUF _BSK-POST-LEN @
+    BSK-POST-JSON
+    DUP 0= IF 2DROP ." bsky: create failed (network)" CR 0 EXIT THEN
+    2DROP
+    BSK-HTTP-STATUS @ 200 = ;
+
+\ ── §5.2  BSK-POST ────────────────────────────────────────────────
+\
+\  BSK-POST ( text-addr text-len -- )
+\  Post a new skeet.
+
+: BSK-POST  ( addr len -- )
+    S" app.bsky.feed.post" _BSK-CR-OPEN
+    S" text" _BSK-QK
+    _BSK-QV-ESC
+    _BSK-COMMA
+    _BSK-CREATED-AT
+    _BSK-CR-CLOSE
+    _BSK-DO-CREATE IF
+        ." Posted!" CR
+    ELSE
+        ." bsky: post failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ ── §5.3  BSK-REPLY ───────────────────────────────────────────────
+\
+\  BSK-REPLY ( uri-addr uri-len cid-addr cid-len text-addr text-len -- )
+\  Reply to a post.  For simplicity, root = parent (no deep threading).
+
+VARIABLE _BSK-REPLY-UADDR   VARIABLE _BSK-REPLY-ULEN
+VARIABLE _BSK-REPLY-CADDR   VARIABLE _BSK-REPLY-CLEN
+
+: BSK-REPLY  ( uaddr ulen caddr clen taddr tlen -- )
+    \ Save reply target
+    2>R 2>R
+    _BSK-REPLY-ULEN !  _BSK-REPLY-UADDR !
+    2R> _BSK-REPLY-CLEN !  _BSK-REPLY-CADDR !
+    2R>                               ( text-addr text-len )
+    S" app.bsky.feed.post" _BSK-CR-OPEN
+    S" text" _BSK-QK
+    _BSK-QV-ESC
+    _BSK-COMMA
+    \ Build reply object (root = parent for simplicity)
+    S" reply" _BSK-QK
+    123 BSK-EMIT                      \ {
+    \ root
+    S" root" _BSK-QK
+    123 BSK-EMIT
+    S" uri" _BSK-QK
+    _BSK-REPLY-UADDR @ _BSK-REPLY-ULEN @ _BSK-QV  _BSK-COMMA
+    S" cid" _BSK-QK
+    _BSK-REPLY-CADDR @ _BSK-REPLY-CLEN @ _BSK-QV
+    125 BSK-EMIT  _BSK-COMMA         \ },
+    \ parent = root
+    S" parent" _BSK-QK
+    123 BSK-EMIT
+    S" uri" _BSK-QK
+    _BSK-REPLY-UADDR @ _BSK-REPLY-ULEN @ _BSK-QV  _BSK-COMMA
+    S" cid" _BSK-QK
+    _BSK-REPLY-CADDR @ _BSK-REPLY-CLEN @ _BSK-QV
+    125 BSK-EMIT                      \ }
+    125 BSK-EMIT  _BSK-COMMA         \ },  (close reply)
+    _BSK-CREATED-AT
+    _BSK-CR-CLOSE
+    _BSK-DO-CREATE IF
+        ." Replied!" CR
+    ELSE
+        ." bsky: reply failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ ── §5.4  BSK-LIKE ────────────────────────────────────────────────
+\
+\  BSK-LIKE ( uri-addr uri-len cid-addr cid-len -- )
+\  Like a post.
+
+: BSK-LIKE  ( uaddr ulen caddr clen -- )
+    S" app.bsky.feed.like" _BSK-CR-OPEN
+    _BSK-SUBJECT
+    _BSK-COMMA
+    _BSK-CREATED-AT
+    _BSK-CR-CLOSE
+    _BSK-DO-CREATE IF
+        ." Liked!" CR
+    ELSE
+        ." bsky: like failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ ── §5.5  BSK-REPOST ─────────────────────────────────────────────
+\
+\  BSK-REPOST ( uri-addr uri-len cid-addr cid-len -- )
+\  Repost (reshare).
+
+: BSK-REPOST  ( uaddr ulen caddr clen -- )
+    S" app.bsky.feed.repost" _BSK-CR-OPEN
+    _BSK-SUBJECT
+    _BSK-COMMA
+    _BSK-CREATED-AT
+    _BSK-CR-CLOSE
+    _BSK-DO-CREATE IF
+        ." Reposted!" CR
+    ELSE
+        ." bsky: repost failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ =====================================================================
+\  §5 — End of Write Features
 \ =====================================================================
