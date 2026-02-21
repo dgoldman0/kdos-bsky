@@ -258,9 +258,9 @@ VARIABLE _BSK-TS-YEAR
         OVER 9 = OR                \ tab
         OVER 10 = OR               \ LF
         SWAP 13 = OR               \ CR
-    WHILE
+        0= IF EXIT THEN            \ not whitespace — done
         1 /STRING
-    REPEAT THEN ;
+    REPEAT ;
 
 \ _JSON-MATCH? ( addr len paddr plen -- flag )
 \   True if the first plen bytes at addr match paddr.
@@ -315,7 +315,7 @@ VARIABLE _JK-LN
     OVER C@ 34 <> IF 2DROP 0 0 EXIT THEN
     1 /STRING                        \ skip opening "
     OVER                             ( addr' len' start )
-    >R 0                             ( addr' len' 0=count ) R: start
+    >R 0                             ( addr' len' 0=count -- R: start )
     BEGIN
         OVER 0>
     WHILE
@@ -341,7 +341,7 @@ VARIABLE _JSON-NUM-NEG
 : JSON-GET-NUMBER  ( addr len -- n )
     0 _JSON-NUM-NEG !
     JSON-SKIP-WS
-    DUP 0<= IF 2DROP 0 EXIT THEN
+    DUP 0> 0= IF 2DROP 0 EXIT THEN
     OVER C@ 45 = IF
         -1 _JSON-NUM-NEG !
         1 /STRING
@@ -350,11 +350,14 @@ VARIABLE _JSON-NUM-NEG
     BEGIN
         OVER 0> WHILE
         2 PICK C@ DUP 48 >= SWAP 57 <= AND
-    WHILE
+        0= IF NIP NIP                \ not a digit — done
+            _JSON-NUM-NEG @ IF NEGATE THEN
+            EXIT
+        THEN
         10 *
         2 PICK C@ 48 - +
         >R 1 /STRING R>
-    REPEAT THEN
+    REPEAT
     NIP NIP
     _JSON-NUM-NEG @ IF NEGATE THEN ;
 
@@ -386,7 +389,7 @@ VARIABLE _JSON-NUM-NEG
 VARIABLE _JSON-DEPTH
 : JSON-SKIP-VALUE  ( addr len -- addr' len' )
     JSON-SKIP-WS
-    DUP 0<= IF EXIT THEN
+    DUP 0> 0= IF EXIT THEN
     OVER C@
     DUP 34 = IF                      \ " → string
         DROP JSON-SKIP-STRING EXIT
@@ -444,11 +447,11 @@ VARIABLE _JSON-DEPTH
 \   Advance to next array element.  Returns 0 0 at end of array.
 : JSON-NEXT-ITEM  ( addr len -- addr' len' | 0 0 )
     JSON-SKIP-WS
-    DUP 0<= IF 2DROP 0 0 EXIT THEN
+    DUP 0> 0= IF 2DROP 0 0 EXIT THEN
     OVER C@ 93 = IF 2DROP 0 0 EXIT THEN   \ ]
     OVER C@ 44 = IF 1 /STRING THEN        \ skip ,
     JSON-SKIP-WS
-    DUP 0<= IF 2DROP 0 0 EXIT THEN
+    DUP 0> 0= IF 2DROP 0 0 EXIT THEN
     OVER C@ 93 = IF 2DROP 0 0 EXIT THEN ;
 
 \ =====================================================================
