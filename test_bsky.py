@@ -58,7 +58,7 @@ def _next_line_chunk(data, pos):
 # ---------------------------------------------------------------------------
 #  Snapshot cache — avoids re-interpreting KDOS+bsky.f for every test
 # ---------------------------------------------------------------------------
-_snapshot = None   # (mem_bytes, cpu_state)
+_snapshot = None   # (mem_bytes, ext_mem_bytes, cpu_state)
 _bios_code = None
 
 
@@ -142,7 +142,7 @@ def build_snapshot():
     sys_obj.load_binary(0, _bios_code)
     sys_obj.boot()
 
-    all_lines = kdos_lines + tools_lines + bsky_lines + test_helpers
+    all_lines = kdos_lines + tools_lines + ['ENTER-USERLAND'] + bsky_lines + test_helpers
     payload = "\n".join(all_lines) + "\n"
     data = payload.encode()
     pos = 0
@@ -173,18 +173,19 @@ def build_snapshot():
         for line in boot_text.strip().split("\n")[-10:]:
             print(f"    | {line}")
 
-    _snapshot = (bytes(sys_obj.cpu.mem), _save_cpu_state(sys_obj.cpu))
+    _snapshot = (bytes(sys_obj.cpu.mem), bytes(sys_obj._ext_mem), _save_cpu_state(sys_obj.cpu))
     print("  Snapshot ready.\n")
     return boot_text
 
 
 def run_forth(lines, max_steps=50_000_000):
     """Restore from snapshot, evaluate Forth lines, return UART text."""
-    mem_bytes, cpu_state = _snapshot
+    mem_bytes, ext_mem_bytes, cpu_state = _snapshot
 
     sys_obj = make_system(ram_kib=1024, ext_mem_mib=16)
     buf = capture_uart(sys_obj)
     sys_obj.cpu.mem[:len(mem_bytes)] = mem_bytes
+    sys_obj._ext_mem[:len(ext_mem_bytes)] = ext_mem_bytes
     _restore_cpu_state(sys_obj.cpu, cpu_state)
 
     payload = "\n".join(lines) + "\nBYE\n"
@@ -858,6 +859,35 @@ def test_stage4():
           ['BSK-INIT',
            ': _T BSK-NOTIF ; _T'],
           "login first")
+
+    # §2.5 — Chunked transfer encoding decoder
+    check("Dechunk single chunk",
+          ['BSK-INIT'] +
+          jstr('5\r\nhello\r\n0\r\n\r\n') +
+          [': _T TA _PR-BLEN ! _PR-BADDR ! _BSK-DECHUNK',
+           '  _PR-BADDR @ _PR-BLEN @ TYPE ; _T'],
+          "hello")
+
+    check("Dechunk chunk size",
+          ['BSK-INIT'] +
+          jstr('3\r\nabc\r\n0\r\n\r\n') +
+          [': _T TA _PR-BLEN ! _PR-BADDR ! _BSK-DECHUNK',
+           '  _PR-BLEN @ . ; _T'],
+          "3 ")
+
+    check("Dechunk hex chunk size",
+          ['BSK-INIT'] +
+          jstr('a\r\n0123456789\r\n0\r\n\r\n') +
+          [': _T TA _PR-BLEN ! _PR-BADDR ! _BSK-DECHUNK',
+           '  _PR-BADDR @ _PR-BLEN @ TYPE ; _T'],
+          "0123456789")
+
+    check("Parse chunk size basic",
+          ['BSK-INIT'] +
+          jstr('ddb\r\ndata') +
+          [': _T TA _BSK-PARSE-CHUNK-SIZE . . ; _T'],
+          None,
+          lambda out: '5 3547' in out or '5 3547 ' in out)
 
 
 # ---------------------------------------------------------------------------

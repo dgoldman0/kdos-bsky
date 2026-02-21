@@ -485,12 +485,13 @@ VARIABLE _JSON-DEPTH
 \
 \  Session-lifetime buffers for XRPC communication.
 \
-\  Large receive buffer lives in HBW (3 MiB fast BRAM), avoiding
-\  Bank 0 heap fragmentation.  Small fixed-size credential buffers
+\  Large receive buffer lives in external RAM (XMEM), accessible from
+\  both system and userland modes.  HBW is supervisor-only so cannot
+\  be used by userland code.  Small fixed-size credential buffers
 \  live in dictionary space (static CREATE+ALLOT).
 
 65536 CONSTANT BSK-RECV-MAX          \ 64 KB receive buffer
-VARIABLE BSK-RECV-BUF   0 BSK-RECV-BUF !   \ HBW address (set by BSK-INIT)
+VARIABLE BSK-RECV-BUF   0 BSK-RECV-BUF !   \ XMEM address (set by BSK-INIT)
 VARIABLE BSK-RECV-LEN   0 BSK-RECV-LEN !   \ bytes received
 
 \ Token storage — AT Protocol JWTs are typically ~900 bytes
@@ -513,10 +514,10 @@ VARIABLE BSK-HANDLE-LEN   0 BSK-HANDLE-LEN !
 VARIABLE BSK-SERVER-IP     0 BSK-SERVER-IP !
 VARIABLE BSK-READY         0 BSK-READY !    \ -1 after successful BSK-INIT
 
-\ BSK-INIT ( -- )  Allocate HBW recv buffer, clear credential state
+\ BSK-INIT ( -- )  Allocate XMEM recv buffer, clear credential state
 : BSK-INIT  ( -- )
     BSK-READY @ IF EXIT THEN        \ already initialised
-    BSK-RECV-MAX HBW-ALLOT BSK-RECV-BUF !
+    BSK-RECV-MAX XMEM-ALLOT BSK-RECV-BUF !
     0 BSK-RECV-LEN !
     BSK-ACCESS-JWT BSK-JWT-MAX 0 FILL   0 BSK-ACCESS-LEN !
     BSK-REFRESH-JWT BSK-JWT-MAX 0 FILL  0 BSK-REFRESH-LEN !
@@ -694,35 +695,140 @@ VARIABLE BSK-HTTP-STATUS             \ last HTTP status code (200, 401, etc.)
 \   Extract 3-digit HTTP status from "HTTP/1.1 NNN ..." response line.
 \   Expects addr to point at start of response.
 : _BSK-PARSE-STATUS  ( addr len -- status )
-    9 < IF DROP 0 EXIT THEN          \ too short
-    DUP 9 + SWAP 9 + DROP            \ skip "HTTP/1.x "
-    \ addr now points at status digits (3 chars at offset 9)
+    9 < IF DROP 0 EXIT THEN          \ too short — len consumed, addr remains
+    9 +                              \ addr+9 = status digits
+    \ 3 chars at offset 9: "2" "0" "0"
     DUP C@ 48 - 100 *
     OVER 1+ C@ 48 - 10 * +
     SWAP 2 + C@ 48 - + ;
 
 \ BSK-PARSE-RESPONSE ( -- body-addr body-len status )
 \   Parse the raw HTTP response in BSK-RECV-BUF.
-\   Returns body pointer (inside HBW buffer), body length, and status code.
+\   Returns body pointer (inside recv buffer), body length, and status code.
+\   Handles chunked transfer encoding (dechunks in place).
+\   Split into helpers to stay within KDOS compiler limits.
+VARIABLE _BSK-HDR-OFF                   \ header-end offset (temp)
+VARIABLE _PR-BADDR                      \ body address (result)
+VARIABLE _PR-BLEN                       \ body length  (result)
+
+\ ── Chunked transfer encoding decoder ──
+\  (Must be defined before _BSK-MAYBE-DECHUNK — Forth requires
+\   all called words to be defined before the caller.)
+
+\ _BSK-HEX-VAL ( char -- n | -1 )
+\   Convert one hex character to its value, or -1 if invalid.
+: _BSK-HEX-VAL  ( char -- n | -1 )
+    DUP 48 >= OVER 57 <= AND IF 48 - EXIT THEN   \ 0-9
+    DUP 65 >= OVER 70 <= AND IF 55 - EXIT THEN   \ A-F
+    DUP 97 >= OVER 102 <= AND IF 87 - EXIT THEN  \ a-f
+    DROP -1 ;
+
+\ _BSK-PARSE-CHUNK-SIZE ( addr len -- chunk-size hdr-len | -1 0 )
+\   Parse hex chunk size at start of addr.  Returns the numeric size
+\   and the number of bytes consumed (hex digits + \r\n).
+\   Returns -1 0 on parse failure.
+: _BSK-PARSE-CHUNK-SIZE  ( addr len -- chunk-size hdr-len | -1 0 )
+    0 0                              ( addr len accum digits )
+    BEGIN
+        2 PICK 0>                    \ len > 0 ?
+    WHILE
+        3 PICK C@                    ( addr len accum digits char )
+        DUP 13 = IF                  \ CR — end of hex digits
+            DROP
+            2 PICK 2 >= IF           \ need at least \r\n after len
+                2SWAP 2DROP          ( accum digits )
+                \ Skip \r\n (2 bytes) → hdr-len = digits + 2
+                2 + EXIT
+            ELSE
+                2DROP 2DROP -1 0 EXIT
+            THEN
+        THEN
+        _BSK-HEX-VAL DUP -1 = IF
+            DROP 2DROP 2DROP -1 0 EXIT  \ invalid char
+        THEN
+        >R SWAP 16 * R> + SWAP 1+   ( addr len accum' digits' )
+        >R >R 1 /STRING R> R>       ( addr' len' accum digits )
+    REPEAT
+    2DROP 2DROP -1 0 ;               \ ran out of data
+
+\ _BSK-DECHUNK ( -- )
+\   Remove chunked transfer encoding from body data (in place).
+\   Reads body from _PR-BADDR / _PR-BLEN, compacts chunk payloads
+\   by removing chunk headers and trailers, writes result back.
+\   Split into small helpers to stay within KDOS compiler limits.
+VARIABLE _DC-DST
+VARIABLE _DC-TOTAL
+VARIABLE _DC-DONE
+VARIABLE _DC-CSIZ                      \ current chunk size
+VARIABLE _DC-HLEN                      \ chunk header length
+
+\ Store "parse failed" result — return accumulated data so far.
+: _DC-ON-FAIL  ( -- )
+    _DC-DST @ _PR-BADDR !
+    _DC-TOTAL @ _PR-BLEN !
+    TRUE _DC-DONE ! ;
+
+\ Store "end of chunks" result — body start = dst - total.
+: _DC-ON-END  ( -- )
+    _DC-DST @ _DC-TOTAL @ - _PR-BADDR !
+    _DC-TOTAL @ _PR-BLEN !
+    TRUE _DC-DONE ! ;
+
+\ Copy one chunk's payload to the compacted destination.
+: _DC-COPY-ONE  ( addr len -- addr' len' )
+    _DC-HLEN @ /STRING              \ skip chunk header
+    _DC-CSIZ @ OVER MIN             \ copy-len = min(chunk, remain)
+    >R
+    OVER _DC-DST @ R@ CMOVE         \ compact chunk data
+    R> DUP _DC-DST +!  DUP _DC-TOTAL +!
+    /STRING                          \ skip past chunk data
+    DUP 2 >= IF 2 /STRING THEN ;    \ skip trailing \r\n
+
+\ Process one chunk: parse header, dispatch.
+: _DC-STEP  ( addr len -- addr' len' )
+    2DUP _BSK-PARSE-CHUNK-SIZE       ( addr len cs hl )
+    _DC-HLEN !  _DC-CSIZ !           ( addr len )
+    _DC-CSIZ @ -1 = IF  2DROP 0 0 _DC-ON-FAIL  EXIT  THEN
+    _DC-CSIZ @  0= IF  2DROP 0 0 _DC-ON-END   EXIT  THEN
+    _DC-COPY-ONE ;
+
+\ Main dechunk loop — reads/writes _PR-BADDR, _PR-BLEN.
+: _BSK-DECHUNK  ( -- )
+    _PR-BADDR @ _DC-DST !
+    0 _DC-TOTAL !   FALSE _DC-DONE !
+    _PR-BADDR @ _PR-BLEN @           ( addr len )
+    BEGIN  DUP 0> _DC-DONE @ 0= AND  WHILE
+        _DC-STEP
+    REPEAT
+    2DROP
+    _DC-DONE @ 0= IF _DC-ON-END THEN ;
+
+\ ── Response parser helpers ──
+
+: _BSK-CLAMP-CLEN  ( -- )
+    _HTTP-CLEN @ -1 <> IF
+        _PR-BLEN @ _HTTP-CLEN @ MIN _PR-BLEN !
+    THEN ;
+
+: _BSK-MAYBE-DECHUNK  ( -- )
+    _HTTP-CLEN @ -1 <> IF EXIT THEN
+    _PR-BLEN @ 1 < IF EXIT THEN
+    _BSK-DECHUNK ;
+
 : BSK-PARSE-RESPONSE  ( -- body-addr body-len status )
     BSK-RECV-BUF @ BSK-RECV-LEN @ _BSK-PARSE-STATUS
     BSK-HTTP-STATUS !
-    \ Find header/body boundary
     BSK-RECV-BUF @ BSK-RECV-LEN @ _HTTP-FIND-HEND
     _HTTP-HEND @ 0= IF
-        0 0 BSK-HTTP-STATUS @ EXIT   \ no headers found
+        0 0 BSK-HTTP-STATUS @ EXIT
     THEN
-    \ _HTTP-HEND is absolute address — convert to offset
-    _HTTP-HEND @ BSK-RECV-BUF @ - >R  \ R: hdr-end offset
-    \ Parse Content-Length from headers
-    BSK-RECV-BUF @ R@ _HTTP-PARSE-CLEN
-    \ Body starts at hdr-end offset, length = total - offset
-    BSK-RECV-BUF @ R@ +              ( body-addr )
-    BSK-RECV-LEN @ R> -              ( body-addr body-len )
-    _HTTP-CLEN @ -1 <> IF
-        _HTTP-CLEN @ MIN
-    THEN
-    BSK-HTTP-STATUS @ ;
+    _HTTP-HEND @ BSK-RECV-BUF @ - _BSK-HDR-OFF !
+    BSK-RECV-BUF @ _BSK-HDR-OFF @ _HTTP-PARSE-CLEN
+    BSK-RECV-BUF @ _BSK-HDR-OFF @ + _PR-BADDR !
+    BSK-RECV-LEN @ _BSK-HDR-OFF @ - _PR-BLEN !
+    _BSK-CLAMP-CLEN
+    _BSK-MAYBE-DECHUNK
+    _PR-BADDR @ _PR-BLEN @ BSK-HTTP-STATUS @ ;
 
 \ ── §2.6  High-Level Wrappers ─────────────────────────────────────
 \
@@ -964,6 +1070,23 @@ VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
         DROP TYPE
     THEN ;
 
+\ ── Path scratch buffer ──
+\
+\  BSK-BUF is shared with BSK-BUILD-GET/POST, so path builders must
+\  copy their result into a separate buffer before calling BSK-GET.
+
+512 CONSTANT _BSK-PATH-MAX
+CREATE _BSK-PATH-BUF _BSK-PATH-MAX ALLOT
+VARIABLE _BSK-PATH-LEN   0 _BSK-PATH-LEN !
+
+\ _BSK-SAVE-PATH ( -- addr len )
+\   Copy current BSK-BUF contents into _BSK-PATH-BUF and return
+\   a pointer to the copy.  Call after building a path in BSK-BUF.
+: _BSK-SAVE-PATH  ( -- addr len )
+    BSK-LEN @ _BSK-PATH-MAX MIN DUP _BSK-PATH-LEN !
+    BSK-BUF _BSK-PATH-BUF ROT CMOVE
+    _BSK-PATH-BUF _BSK-PATH-LEN @ ;
+
 \ ── §4.1  Timeline ────────────────────────────────────────────────
 \
 \  BSK-TL ( -- )  Fetch and display recent timeline posts (5 items).
@@ -1022,7 +1145,7 @@ VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
         S" &cursor=" BSK-APPEND
         BSK-TL-CURSOR BSK-TL-CURSOR-LEN @ URL-ENCODE
     THEN
-    BSK-BUF BSK-LEN @ ;
+    _BSK-SAVE-PATH ;
 
 \ BSK-TL ( -- )   Display recent timeline posts
 : BSK-TL  ( -- )
@@ -1086,7 +1209,7 @@ VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
     BSK-RESET
     S" /xrpc/app.bsky.actor.getProfile?actor=" BSK-APPEND
     URL-ENCODE
-    BSK-BUF BSK-LEN @ ;
+    _BSK-SAVE-PATH ;
 
 : BSK-PROFILE  ( "handle" -- )
     BSK-ACCESS-LEN @ 0= IF ." bsky: login first" CR EXIT THEN
@@ -1187,7 +1310,7 @@ VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
     BSK-ACCESS-LEN @ 0= IF ." bsky: login first" CR EXIT THEN
     BSK-RESET
     S" /xrpc/app.bsky.notification.listNotifications?limit=10" BSK-APPEND
-    BSK-BUF BSK-LEN @ BSK-GET      ( body-addr body-len )
+    _BSK-SAVE-PATH BSK-GET         ( body-addr body-len )
     DUP 0= IF 2DROP ." bsky: notif fetch failed" CR EXIT THEN
     BSK-HTTP-STATUS @ 200 <> IF
         ." bsky: notif error (HTTP " BSK-HTTP-STATUS @ . ." )" CR

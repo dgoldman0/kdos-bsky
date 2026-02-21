@@ -271,9 +271,9 @@ def main():
     sys_obj.load_binary(0, bios_code)
     sys_obj.boot()
 
-    # 4. Load KDOS + tools.f + bsky.f + config.f + network config
-    print("Loading KDOS + tools.f + bsky.f ...")
-    all_lines = kdos_lines + tools_lines + bsky_lines + config_lines + autoexec_lines
+    # 4. Load KDOS + tools.f, enter userland, then bsky.f + config.f + network config
+    print("Loading KDOS + tools.f + bsky.f (userland) ...")
+    all_lines = kdos_lines + tools_lines + ['ENTER-USERLAND'] + bsky_lines + config_lines + autoexec_lines
     steps = feed_lines(sys_obj, buf, all_lines)
     boot_text = uart_text(buf)
     print(f"  Boot: {steps:,} steps")
@@ -324,10 +324,13 @@ def main():
         'BSK-INIT',
         ': _LIVETEST',
         '  S" /xrpc/com.atproto.server.describeServer" BSK-GET',
+        '  ." [BLEN] " DUP . CR',
+        '  ." [BADDR] " OVER . CR',
+        '  ." [STATUS] " BSK-HTTP-STATUS @ . CR',
         '  DUP 0> IF',
-        '    ." [BODY] " TYPE CR',
+        '    DUP 200 MIN TYPE CR',
         '  ELSE',
-        '    ." [FAIL] status=" . CR',
+        '    ." [EMPTY]" CR 2DROP',
         '  THEN',
         '  ." ##DONE##" CR ;',
     ]
@@ -353,11 +356,11 @@ def main():
 
     # Check for success
     success = False
-    if "[BODY]" in result_text and "availableUserDomains" in result_text:
-        print("\n  *** SUCCESS: Got valid JSON response from bsky.social! ***")
+    if "[BLEN]" in result_text and "[STATUS] 200" in result_text:
+        print("\n  *** SUCCESS: Got valid response from bsky.social! ***")
         success = True
-    elif "[BODY]" in result_text:
-        print("\n  *** PARTIAL: Got response body but unexpected content ***")
+    elif "[BLEN]" in result_text:
+        print("\n  *** PARTIAL: Got response but unexpected status ***")
     elif "[FAIL]" in result_text:
         print("\n  *** FAILED: No response received ***")
     elif "TLS connect failed" in result_text:
@@ -409,6 +412,86 @@ def main():
                 login_success = False
     else:
         print("\n--- BSK-LOGIN (skipped: no config.f) ---")
+
+    # ── Stage 4 live tests (require login) ──────────────────────
+    # Strategy: Use raw BSK-GET to fetch each endpoint, dump the raw
+    # body to UART as hex so we can inspect the actual data in
+    # live_results.txt.  Also test the high-level display words.
+
+    stage4_results = {}  # name -> output text
+
+    if login_success:
+        # 9. BSK-GET — test all three authenticated endpoints in one word
+        # (KDOS has limited TCP socket pool; consolidating minimizes
+        #  connection count)
+        print("\n--- Stage 4: Authenticated BSK-GET tests ---")
+        buf.clear()
+        feed_lines(sys_obj, buf, [
+            ': _STAGE4-GET',
+            '  S" /xrpc/app.bsky.feed.getTimeline?limit=1" BSK-GET',
+            '  DUP 0> IF',
+            '    ." [TL-OK] len=" DUP . ." status=" BSK-HTTP-STATUS @ . CR',
+            '    2DROP',
+            '  ELSE ." [TL-FAIL] " . CR THEN',
+            '  S" /xrpc/app.bsky.notification.listNotifications?limit=3" BSK-GET',
+            '  DUP 0> IF',
+            '    ." [NOTIF-OK] len=" DUP . ." status=" BSK-HTTP-STATUS @ . CR',
+            '    2DROP',
+            '  ELSE ." [NOTIF-FAIL] " . CR THEN',
+            '  ." ##S4GET-DONE##" CR ;',
+        ])
+        buf.clear()
+        print("  Fetching notifications + timeline ...")
+        steps = run_net_command(sys_obj, buf, ['_STAGE4-GET'],
+                               timeout_sec=120, sentinel="##S4GET-DONE")
+        s4_text = uart_text(buf)
+        stage4_results['BSK-GET-tests'] = s4_text
+        print(f"  Completed in {steps:,} steps")
+        for line in s4_text.strip().split("\n"):
+            line = line.strip()
+            if not line or line == 'ok' or line.startswith('>'):
+                continue
+            print(f"  {line[:160]}")
+
+        # 10. BSK-PROFILE display word
+        print("\n--- BSK-PROFILE ---")
+        buf.clear()
+        feed_lines(sys_obj, buf, [
+            ': _PROFTEST BSK-HANDLE BSK-HANDLE-LEN @ _BSK-PROFILE-WITH',
+            '  ." ##PROF-DONE##" CR ;',
+        ])
+        buf.clear()
+        print("  Running BSK-PROFILE ...")
+        steps = run_net_command(sys_obj, buf, ['_PROFTEST'],
+                               timeout_sec=120, sentinel="##PROF-DONE")
+        prof_text = uart_text(buf)
+        stage4_results['BSK-PROFILE'] = prof_text
+        print(f"  Completed in {steps:,} steps")
+        for line in prof_text.strip().split("\n"):
+            line = line.strip()
+            if not line or line == 'ok' or line.startswith('>'):
+                continue
+            print(f"  {line[:160]}")
+
+    else:
+        print("\n--- Stage 4 live tests SKIPPED (login required) ---")
+
+    # Write stage 4 results to file for manual inspection
+    if stage4_results:
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "live_results.txt")
+        with open(results_path, 'w') as f:
+            for name, text in stage4_results.items():
+                f.write(f"{'=' * 60}\n")
+                f.write(f"  {name}\n")
+                f.write(f"{'=' * 60}\n")
+                for line in text.strip().split("\n"):
+                    line = line.strip()
+                    if not line or line == 'ok' or line.startswith('>'):
+                        continue
+                    f.write(f"  {line}\n")
+                f.write("\n")
+        print(f"\n  Stage 4 results written to live_results.txt")
 
     # Dump packet log
     print("\n--- Packet Log (last 60) ---")
