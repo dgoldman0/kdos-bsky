@@ -33,6 +33,7 @@ BIOS_ASM = os.path.join(EMU_DIR, "bios.asm")
 KDOS_F   = os.path.join(EMU_DIR, "kdos.f")
 TOOLS_F  = os.path.join(EMU_DIR, "tools.f")
 BSKY_F   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bsky.f")
+CONFIG_F = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.f")
 
 # ---------------------------------------------------------------------------
 #  Packet logger
@@ -246,6 +247,17 @@ def main():
         '8 DNS-SERVER-IP C! 8 DNS-SERVER-IP 1+ C! 8 DNS-SERVER-IP 2 + C! 8 DNS-SERVER-IP 3 + C!',
     ]
 
+    # Read config.f if it exists (credentials for login test)
+    config_lines = []
+    has_config = os.path.exists(CONFIG_F)
+    if has_config:
+        with open(CONFIG_F) as f:
+            config_lines = [line for line in f.read().splitlines()
+                           if line.strip() and not line.strip().startswith('\\')]
+        print(f"  config.f: {len(config_lines)} lines")
+    else:
+        print("  config.f: not found (login test will be skipped)")
+
     # 3. Create system with TAP backend
     print("\nCreating system with TAP backend ...")
     tap = TAPBackend("mp64tap0")
@@ -259,9 +271,9 @@ def main():
     sys_obj.load_binary(0, bios_code)
     sys_obj.boot()
 
-    # 4. Load KDOS + tools.f + bsky.f + network config
+    # 4. Load KDOS + tools.f + bsky.f + config.f + network config
     print("Loading KDOS + tools.f + bsky.f ...")
-    all_lines = kdos_lines + tools_lines + bsky_lines + autoexec_lines
+    all_lines = kdos_lines + tools_lines + bsky_lines + config_lines + autoexec_lines
     steps = feed_lines(sys_obj, buf, all_lines)
     boot_text = uart_text(buf)
     print(f"  Boot: {steps:,} steps")
@@ -355,6 +367,49 @@ def main():
     else:
         print("\n  *** UNKNOWN: Check output above ***")
 
+    # 8. BSK-LOGIN — live authentication (only if config.f has real creds)
+    login_success = None  # None = skipped
+    if has_config:
+        # Check if config.f still has placeholder values
+        config_text = open(CONFIG_F).read()
+        if "yourhandle" in config_text or "xxxx-xxxx" in config_text:
+            print("\n--- BSK-LOGIN (skipped: config.f has placeholder values) ---")
+            print("  Edit config.f with your handle and app password to enable")
+        else:
+            print("\n--- BSK-LOGIN ---")
+            buf.clear()
+            login_def = [
+                ': _LOGINTEST',
+                '  BSK-MY-HANDLE BSK-MY-PASS BSK-LOGIN-WITH',
+                '  BSK-WHO',
+                '  ." ##LOGIN-DONE##" CR ;',
+            ]
+            feed_lines(sys_obj, buf, login_def)
+            buf.clear()
+            print("  Logging in via BSK-LOGIN-WITH ...")
+            steps = run_net_command(sys_obj, buf, ['_LOGINTEST'],
+                                   timeout_sec=120, sentinel="##LOGIN-DONE")
+            login_text = uart_text(buf)
+            print(f"  Completed in {steps:,} steps")
+            print()
+            for line in login_text.strip().split("\n"):
+                line = line.strip()
+                if not line or line == 'ok' or line.startswith('>'):
+                    continue
+                if len(line) > 120:
+                    print(f"  {line[:120]}...")
+                else:
+                    print(f"  {line}")
+
+            if "Logged in as" in login_text:
+                print("\n  *** SUCCESS: BSK-LOGIN authenticated! ***")
+                login_success = True
+            else:
+                print("\n  *** FAILED: BSK-LOGIN did not authenticate ***")
+                login_success = False
+    else:
+        print("\n--- BSK-LOGIN (skipped: no config.f) ---")
+
     # Dump packet log
     print("\n--- Packet Log (last 60) ---")
     for _, summary in PKT_LOG[-60:]:
@@ -362,7 +417,12 @@ def main():
     print(f"    Total: {len(PKT_LOG)} packets")
 
     tap.stop()
-    return 0 if success else 1
+    # Fail if describeServer failed, or if login was attempted and failed
+    if not success:
+        return 1
+    if login_success is False:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

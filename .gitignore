@@ -1,3 +1,4 @@
 emu/
 __pycache__/
 *.pyc
+config.f

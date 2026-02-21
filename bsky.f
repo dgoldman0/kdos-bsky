@@ -846,23 +846,9 @@ VARIABLE _BSK-LOGIN-HLEN   0 _BSK-LOGIN-HLEN !
 CREATE _BSK-LOGIN-PASS 128 ALLOT
 VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
 
-: BSK-LOGIN  ( "handle" "password" -- )
+: BSK-LOGIN-WITH  ( handle-addr handle-len pass-addr pass-len -- )
     BSK-INIT
-    \ Parse handle and password from input stream
-    BL WORD COUNT                    ( addr len )
-    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
-    127 MIN DUP _BSK-LOGIN-HLEN !
-    _BSK-LOGIN-HANDLE SWAP CMOVE
-    BL WORD COUNT                    ( addr len )
-    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
-    127 MIN DUP _BSK-LOGIN-PLEN !
-    _BSK-LOGIN-PASS SWAP CMOVE
-    \ Build login JSON
-    _BSK-LOGIN-HANDLE _BSK-LOGIN-HLEN @
-    _BSK-LOGIN-PASS _BSK-LOGIN-PLEN @
     _BSK-BUILD-LOGIN-JSON
-    \ Clear password from memory immediately
-    _BSK-LOGIN-PASS 128 0 FILL  0 _BSK-LOGIN-PLEN !
     \ POST to createSession
     S" /xrpc/com.atproto.server.createSession"
     _BSK-LOGIN-BUF _BSK-LOGIN-LEN @
@@ -882,6 +868,22 @@ VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
         ." bsky: login failed (parse error)" CR EXIT
     THEN
     ." Logged in as " BSK-HANDLE BSK-HANDLE-LEN @ TYPE CR ;
+
+: BSK-LOGIN  ( "handle" "password" -- )
+    \ Parse handle and password from input stream
+    BL WORD COUNT                    ( addr len )
+    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
+    127 MIN DUP _BSK-LOGIN-HLEN !
+    _BSK-LOGIN-HANDLE SWAP CMOVE
+    BL WORD COUNT                    ( addr len )
+    DUP 0= IF 2DROP ." Usage: BSK-LOGIN handle password" CR EXIT THEN
+    127 MIN DUP _BSK-LOGIN-PLEN !
+    _BSK-LOGIN-PASS SWAP CMOVE
+    _BSK-LOGIN-HANDLE _BSK-LOGIN-HLEN @
+    _BSK-LOGIN-PASS _BSK-LOGIN-PLEN @
+    BSK-LOGIN-WITH
+    \ Clear password from memory
+    _BSK-LOGIN-PASS 128 0 FILL  0 _BSK-LOGIN-PLEN ! ;
 
 \ ── §3.4  Token Refresh ───────────────────────────────────────────
 \
