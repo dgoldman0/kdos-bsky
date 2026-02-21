@@ -23,6 +23,7 @@ from asm import assemble
 # ---------------------------------------------------------------------------
 BIOS_ASM = os.path.join(EMU_DIR, "bios.asm")
 KDOS_F   = os.path.join(EMU_DIR, "kdos.f")
+TOOLS_F  = os.path.join(EMU_DIR, "tools.f")
 BSKY_F   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bsky.f")
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,12 @@ def build_snapshot():
         kdos_lines = [line for line in f.read().splitlines()
                       if line.strip() and not line.strip().startswith('\\')]
 
+    # Read tools.f lines (provides _HTTP-FIND-HEND, _HTTP-PARSE-CLEN, etc.)
+    print("  Loading tools.f …")
+    with open(TOOLS_F) as f:
+        tools_lines = [line for line in f.read().splitlines()
+                       if line.strip() and not line.strip().startswith('\\')]
+
     # Read bsky.f lines
     print("  Loading bsky.f …")
     with open(BSKY_F) as f:
@@ -135,7 +142,7 @@ def build_snapshot():
     sys_obj.load_binary(0, _bios_code)
     sys_obj.boot()
 
-    all_lines = kdos_lines + bsky_lines + test_helpers
+    all_lines = kdos_lines + tools_lines + bsky_lines + test_helpers
     payload = "\n".join(all_lines) + "\n"
     data = payload.encode()
     pos = 0
@@ -269,6 +276,14 @@ def jstr(s):
     if cur:
         lines.append(' '.join(cur))
     return lines
+
+
+def jstr_inline(s):
+    """Like jstr() but returns a single Forth line (for embedding in check calls)."""
+    parts = ['TR']
+    for ch in s:
+        parts.append(f'{ord(ch)} TC')
+    return ' '.join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +499,146 @@ def test_stage1():
           "cdef")
 
 
+def test_stage2():
+    """Test §2 HTTP POST and Authenticated GET."""
+    print("── Stage 2: HTTP POST and Authenticated GET ──\n")
+
+    # §2.1 Memory Setup
+    check("BSK-INIT sets READY",
+          ['BSK-INIT BSK-READY @ .'],
+          "-1 ")
+
+    check("BSK-INIT idempotent",
+          ['BSK-INIT BSK-RECV-BUF @ BSK-INIT BSK-RECV-BUF @ = .'],
+          "-1 ")
+
+    check("BSK-RECV-BUF non-zero after init",
+          ['BSK-INIT BSK-RECV-BUF @ 0 > .'],
+          "-1 ")
+
+    check("BSK-RECV-LEN starts at 0",
+          ['BSK-INIT BSK-RECV-LEN @ .'],
+          "0 ")
+
+    check("BSK-ACCESS-LEN starts at 0",
+          ['BSK-INIT BSK-ACCESS-LEN @ .'],
+          "0 ")
+
+    check("BSK-DID-LEN starts at 0",
+          ['BSK-INIT BSK-DID-LEN @ .'],
+          "0 ")
+
+    check("BSK-CLEANUP clears READY",
+          ['BSK-INIT BSK-CLEANUP BSK-READY @ .'],
+          "0 ")
+
+    # §2.2 DNS — can't test actual DNS without a NIC, but test the
+    # _BSK-ENSURE-IP logic (returns -1 when no NIC/DNS available)
+    check("BSK-SERVER-IP starts at 0",
+          ['BSK-INIT BSK-SERVER-IP @ .'],
+          "0 ")
+
+    # §2.3 Request Builders
+    check("BSK-BUILD-GET basic",
+          ['BSK-INIT',
+           ': _T S" /xrpc/test" BSK-BUILD-GET BSK-TYPE ; _T'],
+          None,
+          lambda out: 'GET /xrpc/test HTTP/1.1' in out)
+
+    check("BSK-BUILD-GET has Host header",
+          ['BSK-INIT',
+           ': _T S" /" BSK-BUILD-GET BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Host: bsky.social' in out)
+
+    check("BSK-BUILD-GET has Connection close",
+          ['BSK-INIT',
+           ': _T S" /" BSK-BUILD-GET BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Connection: close' in out)
+
+    check("BSK-BUILD-GET no auth when no token",
+          ['BSK-INIT',
+           ': _T S" /" BSK-BUILD-GET BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Authorization' not in out)
+
+    # Simulate a stored JWT and check auth header appears
+    check("BSK-BUILD-GET with auth token",
+          ['BSK-INIT',
+           ': _T S" tok123" BSK-ACCESS-JWT SWAP CMOVE  6 BSK-ACCESS-LEN ! ;',
+           '_T',
+           ': _T2 S" /" BSK-BUILD-GET BSK-TYPE ; _T2'],
+          None,
+          lambda out: 'Authorization: Bearer tok123' in out)
+
+    check("BSK-BUILD-POST basic",
+          ['BSK-INIT',
+           ': _T S" /xrpc/post" S" {}" BSK-BUILD-POST BSK-TYPE ; _T'],
+          None,
+          lambda out: 'POST /xrpc/post HTTP/1.1' in out)
+
+    check("BSK-BUILD-POST has content-type",
+          ['BSK-INIT',
+           ': _T S" /p" S" {}" BSK-BUILD-POST BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Content-Type: application/json' in out)
+
+    check("BSK-BUILD-POST has content-length",
+          ['BSK-INIT',
+           ': _T S" /p" S" {}" BSK-BUILD-POST BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Content-Length: 2' in out)
+
+    check("BSK-BUILD-POST includes body",
+          ['BSK-INIT',
+           ': _T S" /p" S" {}" BSK-BUILD-POST BSK-TYPE ; _T'],
+          None,
+          lambda out: '{}' in out and 'Content-Length' in out)
+
+    check("BSK-BUILD-POST larger body length",
+          ['BSK-INIT'] +
+          jstr('{"id":"x","pw":"y"}') +
+          [': _T S" /a" TA BSK-BUILD-POST BSK-TYPE ; _T'],
+          None,
+          lambda out: 'Content-Length: 19' in out)
+
+    # §2.5 Response Parser — test _BSK-PARSE-STATUS and BSK-PARSE-RESPONSE
+    # by manually filling the recv buffer
+    check("Parse HTTP 200 status",
+          ['BSK-INIT'] +
+          jstr('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}') +
+          [': _T TA DUP >R BSK-RECV-BUF @ SWAP CMOVE R> BSK-RECV-LEN !',
+           'BSK-PARSE-RESPONSE . TYPE ; _T'],
+          None,
+          lambda out: '200' in out and '{}' in out)
+
+    check("Parse HTTP 401 status",
+          ['BSK-INIT'] +
+          jstr('HTTP/1.1 401 Unauthorized\r\nContent-Length: 5\r\n\r\nerror') +
+          [': _T TA DUP >R BSK-RECV-BUF @ SWAP CMOVE R> BSK-RECV-LEN !',
+           'BSK-PARSE-RESPONSE . TYPE ; _T'],
+          None,
+          lambda out: '401' in out and 'error' in out)
+
+    check("BSK-HTTP-STATUS stored",
+          ['BSK-INIT'] +
+          jstr('HTTP/1.1 200 OK\r\n\r\nhi') +
+          [': _T TA DUP >R BSK-RECV-BUF @ SWAP CMOVE R> BSK-RECV-LEN !',
+           'BSK-PARSE-RESPONSE 2DROP DROP BSK-HTTP-STATUS @ . ; _T'],
+          "200 ")
+
+    # §2.6 — High-level wrappers can't be tested without network, but we
+    # can verify they exist (no compilation errors) by checking their xt
+    check("BSK-GET word exists",
+          ["' BSK-GET 0> ."],
+          "-1 ")
+
+    check("BSK-POST-JSON word exists",
+          ["' BSK-POST-JSON 0> ."],
+          "-1 ")
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -517,6 +672,8 @@ def main():
     test_stage0()
     print()
     test_stage1()
+    print()
+    test_stage2()
 
     print()
     print("=" * 60)

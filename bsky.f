@@ -469,3 +469,277 @@ VARIABLE _JSON-DEPTH
 \    S\" {\"x\":\"hello\",\"y\":42}"
 \    S" y" JSON-FIND-KEY JSON-GET-NUMBER . ;
 \  TEST-JSON2                        → 42
+
+\ =====================================================================
+\  §2  HTTP POST and Authenticated GET
+\ =====================================================================
+\
+\  Extends tools.f's HTTP capabilities with POST, auth headers, and
+\  a large HBW-backed receive buffer.  Reuses _HTTP-FIND-HEND and
+\  _HTTP-PARSE-CLEN from tools.f for response parsing.
+\
+\  Depends on: §0+§1 (string builder, JSON), tools.f (HTTP parsing),
+\              KDOS TLS 1.3 stack, HBW allocator.
+
+\ ── §2.1  Memory Setup ────────────────────────────────────────────
+\
+\  Session-lifetime buffers for XRPC communication.
+\
+\  Large receive buffer lives in HBW (3 MiB fast BRAM), avoiding
+\  Bank 0 heap fragmentation.  Small fixed-size credential buffers
+\  live in dictionary space (static CREATE+ALLOT).
+
+65536 CONSTANT BSK-RECV-MAX          \ 64 KB receive buffer
+VARIABLE BSK-RECV-BUF   0 BSK-RECV-BUF !   \ HBW address (set by BSK-INIT)
+VARIABLE BSK-RECV-LEN   0 BSK-RECV-LEN !   \ bytes received
+
+\ Token storage — AT Protocol JWTs are typically ~900 bytes
+2048 CONSTANT BSK-JWT-MAX
+CREATE BSK-ACCESS-JWT BSK-JWT-MAX ALLOT
+VARIABLE BSK-ACCESS-LEN   0 BSK-ACCESS-LEN !
+CREATE BSK-REFRESH-JWT BSK-JWT-MAX ALLOT
+VARIABLE BSK-REFRESH-LEN  0 BSK-REFRESH-LEN !
+
+\ User identity
+128 CONSTANT BSK-DID-MAX
+CREATE BSK-DID BSK-DID-MAX ALLOT
+VARIABLE BSK-DID-LEN      0 BSK-DID-LEN !
+
+64 CONSTANT BSK-HANDLE-MAX
+CREATE BSK-HANDLE BSK-HANDLE-MAX ALLOT
+VARIABLE BSK-HANDLE-LEN   0 BSK-HANDLE-LEN !
+
+\ Server state
+VARIABLE BSK-SERVER-IP     0 BSK-SERVER-IP !
+VARIABLE BSK-READY         0 BSK-READY !    \ -1 after successful BSK-INIT
+
+\ BSK-INIT ( -- )  Allocate HBW recv buffer, clear credential state
+: BSK-INIT  ( -- )
+    BSK-READY @ IF EXIT THEN        \ already initialised
+    BSK-RECV-MAX HBW-ALLOT BSK-RECV-BUF !
+    0 BSK-RECV-LEN !
+    BSK-ACCESS-JWT BSK-JWT-MAX 0 FILL   0 BSK-ACCESS-LEN !
+    BSK-REFRESH-JWT BSK-JWT-MAX 0 FILL  0 BSK-REFRESH-LEN !
+    BSK-DID BSK-DID-MAX 0 FILL          0 BSK-DID-LEN !
+    BSK-HANDLE BSK-HANDLE-MAX 0 FILL    0 BSK-HANDLE-LEN !
+    0 BSK-SERVER-IP !
+    -1 BSK-READY !
+    ." bsky: init ok" CR ;
+
+\ BSK-CLEANUP ( -- )  Release HBW (bulk reset) and clear state
+: BSK-CLEANUP  ( -- )
+    BSK-READY @ 0= IF EXIT THEN
+    HBW-RESET                        \ reclaim all HBW memory
+    0 BSK-RECV-BUF !
+    0 BSK-READY ! ;
+
+\ ── §2.2  DNS + IP Caching ────────────────────────────────────────
+\
+\  Resolves bsky.social once, caches the IP.  Re-resolves only on
+\  explicit call or connect failure.
+
+CREATE BSK-HOST 16 ALLOT
+11 CONSTANT BSK-HOST-LEN
+: _BSK-HOST-INIT  ( -- )
+    S" bsky.social" BSK-HOST SWAP CMOVE ;
+_BSK-HOST-INIT
+
+\ BSK-RESOLVE ( -- ior )  Resolve bsky.social, cache IP
+: BSK-RESOLVE  ( -- ior )
+    BSK-HOST BSK-HOST-LEN DNS-RESOLVE
+    DUP 0= IF
+        ." bsky: DNS failed" CR -1 EXIT
+    THEN
+    BSK-SERVER-IP !
+    0 ;
+
+\ _BSK-ENSURE-IP ( -- ior )  Resolve if not yet cached
+: _BSK-ENSURE-IP  ( -- ior )
+    BSK-SERVER-IP @ 0= IF BSK-RESOLVE EXIT THEN
+    0 ;
+
+\ ── §2.3  Request Builders ────────────────────────────────────────
+\
+\  Build HTTP/1.1 GET and POST requests into BSK-BUF (4 KB).
+\  Both add Host, Connection: close, and optional Authorization.
+\  POST also adds Content-Type and Content-Length.
+
+\ _BSK-APPEND-CRLF ( -- )  Append \r\n to BSK-BUF
+: _BSK-APPEND-CRLF  ( -- )  13 BSK-EMIT 10 BSK-EMIT ;
+
+\ _BSK-APPEND-HOST ( -- )  Append "Host: bsky.social\r\n"
+: _BSK-APPEND-HOST  ( -- )
+    S" Host: " BSK-APPEND
+    BSK-HOST BSK-HOST-LEN BSK-APPEND
+    _BSK-APPEND-CRLF ;
+
+\ _BSK-APPEND-AUTH ( -- )  Append "Authorization: Bearer <jwt>\r\n"
+\   Only appends if we have an access token.
+: _BSK-APPEND-AUTH  ( -- )
+    BSK-ACCESS-LEN @ 0= IF EXIT THEN
+    S" Authorization: Bearer " BSK-APPEND
+    BSK-ACCESS-JWT BSK-ACCESS-LEN @ BSK-APPEND
+    _BSK-APPEND-CRLF ;
+
+\ _BSK-APPEND-CLOSE ( -- )  Append "Connection: close\r\n"
+: _BSK-APPEND-CLOSE  ( -- )
+    S" Connection: close" BSK-APPEND  _BSK-APPEND-CRLF ;
+
+\ _BSK-APPEND-JSON-CT ( -- )  Append JSON content-type header
+: _BSK-APPEND-JSON-CT  ( -- )
+    S" Content-Type: application/json" BSK-APPEND  _BSK-APPEND-CRLF ;
+
+\ _BSK-APPEND-CLEN ( n -- )  Append "Content-Length: n\r\n"
+: _BSK-APPEND-CLEN  ( n -- )
+    S" Content-Length: " BSK-APPEND
+    NUM>APPEND
+    _BSK-APPEND-CRLF ;
+
+\ BSK-BUILD-GET ( path-addr path-len -- )
+\   Build authenticated GET request in BSK-BUF.
+: BSK-BUILD-GET  ( path-addr path-len -- )
+    BSK-RESET
+    S" GET " BSK-APPEND
+    BSK-APPEND                       \ path
+    S"  HTTP/1.1" BSK-APPEND  _BSK-APPEND-CRLF
+    _BSK-APPEND-HOST
+    _BSK-APPEND-AUTH
+    _BSK-APPEND-CLOSE
+    _BSK-APPEND-CRLF ;              \ blank line = end of headers
+
+\ BSK-BUILD-POST ( path-addr path-len body-addr body-len -- )
+\   Build authenticated POST request in BSK-BUF.
+\   Body content is appended after headers.
+VARIABLE _BSK-BODY-ADDR
+VARIABLE _BSK-BODY-LEN
+
+: BSK-BUILD-POST  ( path-addr path-len body-addr body-len -- )
+    _BSK-BODY-LEN ! _BSK-BODY-ADDR !
+    BSK-RESET
+    S" POST " BSK-APPEND
+    BSK-APPEND                       \ path
+    S"  HTTP/1.1" BSK-APPEND  _BSK-APPEND-CRLF
+    _BSK-APPEND-HOST
+    _BSK-APPEND-AUTH
+    _BSK-APPEND-JSON-CT
+    _BSK-BODY-LEN @ _BSK-APPEND-CLEN
+    _BSK-APPEND-CLOSE
+    _BSK-APPEND-CRLF                \ blank line
+    _BSK-BODY-ADDR @ _BSK-BODY-LEN @ BSK-APPEND ;  \ body
+
+\ ── §2.4  TLS Send/Receive Wrapper ────────────────────────────────
+\
+\  Connect to bsky.social:443, send the request built in BSK-BUF,
+\  receive into HBW recv buffer.
+
+VARIABLE _BSK-CTX                    \ current TLS context
+VARIABLE _BSK-EMPTY                  \ consecutive empty recv counter
+
+\ _BSK-TLS-OPEN ( -- ctx | 0 )  TLS connect to cached server IP
+: _BSK-TLS-OPEN  ( -- ctx | 0 )
+    \ Set SNI hostname
+    BSK-HOST-LEN 63 MIN DUP TLS-SNI-LEN !
+    BSK-HOST TLS-SNI-HOST ROT CMOVE
+    BSK-SERVER-IP @ 443 12345 TLS-CONNECT ;
+
+\ _BSK-RECV-LOOP ( ctx -- )  Receive response into HBW recv buffer
+: _BSK-RECV-LOOP  ( ctx -- )
+    _BSK-CTX !
+    0 BSK-RECV-LEN !  0 _BSK-EMPTY !
+    500 0 DO
+        TCP-POLL NET-IDLE
+        BSK-RECV-LEN @ BSK-RECV-MAX >= IF LEAVE THEN
+        _BSK-CTX @
+        BSK-RECV-BUF @ BSK-RECV-LEN @ +
+        BSK-RECV-MAX BSK-RECV-LEN @ -
+        TLS-RECV
+        DUP 0> IF
+            BSK-RECV-LEN +!
+            0 _BSK-EMPTY !
+        ELSE DUP -1 = IF
+            DROP ." bsky: TLS error" CR LEAVE
+        ELSE
+            DROP
+            BSK-RECV-LEN @ 0> IF
+                _BSK-EMPTY @ 1+ DUP _BSK-EMPTY !
+                10 >= IF LEAVE THEN
+            THEN
+        THEN THEN
+    LOOP ;
+
+\ BSK-XRPC-SEND ( -- ior )
+\   Send BSK-BUF contents over TLS, receive response into HBW buffer.
+: BSK-XRPC-SEND  ( -- ior )
+    _BSK-ENSURE-IP IF -1 EXIT THEN
+    _BSK-TLS-OPEN DUP 0= IF
+        ." bsky: TLS connect failed" CR -1 EXIT
+    THEN
+    DUP >R
+    BSK-BUF BSK-LEN @ ROT -ROT TLS-SEND DROP
+    R@ _BSK-RECV-LOOP
+    R> TLS-CLOSE
+    BSK-RECV-LEN @ 0= IF -1 EXIT THEN
+    0 ;
+
+\ ── §2.5  Response Parser ─────────────────────────────────────────
+\
+\  Parse HTTP status and extract response body.
+\  Reuses _HTTP-FIND-HEND and _HTTP-PARSE-CLEN from tools.f.
+
+VARIABLE BSK-HTTP-STATUS             \ last HTTP status code (200, 401, etc.)
+
+\ _BSK-PARSE-STATUS ( addr len -- status )
+\   Extract 3-digit HTTP status from "HTTP/1.1 NNN ..." response line.
+\   Expects addr to point at start of response.
+: _BSK-PARSE-STATUS  ( addr len -- status )
+    9 < IF DROP 0 EXIT THEN          \ too short
+    DUP 9 + SWAP 9 + DROP            \ skip "HTTP/1.x "
+    \ addr now points at status digits (3 chars at offset 9)
+    DUP C@ 48 - 100 *
+    OVER 1+ C@ 48 - 10 * +
+    SWAP 2 + C@ 48 - + ;
+
+\ BSK-PARSE-RESPONSE ( -- body-addr body-len status )
+\   Parse the raw HTTP response in BSK-RECV-BUF.
+\   Returns body pointer (inside HBW buffer), body length, and status code.
+: BSK-PARSE-RESPONSE  ( -- body-addr body-len status )
+    BSK-RECV-BUF @ BSK-RECV-LEN @ _BSK-PARSE-STATUS
+    BSK-HTTP-STATUS !
+    \ Find header/body boundary
+    BSK-RECV-BUF @ BSK-RECV-LEN @ _HTTP-FIND-HEND
+    _HTTP-HEND @ 0= IF
+        0 0 BSK-HTTP-STATUS @ EXIT   \ no headers found
+    THEN
+    \ _HTTP-HEND is absolute address — convert to offset
+    _HTTP-HEND @ BSK-RECV-BUF @ - >R  \ R: hdr-end offset
+    \ Parse Content-Length from headers
+    BSK-RECV-BUF @ R@ _HTTP-PARSE-CLEN
+    \ Body starts at hdr-end offset, length = total - offset
+    BSK-RECV-BUF @ R@ +              ( body-addr )
+    BSK-RECV-LEN @ R> -              ( body-addr body-len )
+    _HTTP-CLEN @ -1 <> IF
+        _HTTP-CLEN @ MIN
+    THEN
+    BSK-HTTP-STATUS @ ;
+
+\ ── §2.6  High-Level Wrappers ─────────────────────────────────────
+\
+\  Simple words that build a request, send it, and return the body.
+
+\ BSK-GET ( path-addr path-len -- body-addr body-len )
+\   Authenticated GET.  Returns body and length (0 0 on error).
+: BSK-GET  ( path-addr path-len -- body-addr body-len )
+    BSK-BUILD-GET
+    BSK-XRPC-SEND IF 0 0 EXIT THEN
+    BSK-PARSE-RESPONSE DROP ;        \ drop status, caller can check BSK-HTTP-STATUS
+
+\ BSK-POST-JSON ( path-addr path-len json-addr json-len -- body-addr body-len )
+\   Authenticated POST with JSON body.  Returns body and length.
+: BSK-POST-JSON  ( path-addr path-len json-addr json-len -- body-addr body-len )
+    BSK-BUILD-POST
+    BSK-XRPC-SEND IF 0 0 EXIT THEN
+    BSK-PARSE-RESPONSE DROP ;
+
+\ =====================================================================
+\  §2 — End of HTTP POST and Authenticated GET
+\ =====================================================================
