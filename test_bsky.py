@@ -146,7 +146,7 @@ def build_snapshot():
     payload = "\n".join(all_lines) + "\n"
     data = payload.encode()
     pos = 0
-    max_steps = 400_000_000
+    max_steps = 500_000_000
     total = 0
 
     while total < max_steps:
@@ -1099,6 +1099,195 @@ def test_stage5():
                       and '"rkey":"3xyz789"' in out))
 
 
+def test_stage6():
+    """Test §6 Interactive TUI (cache data model, accessors, renderers)."""
+    print("── Stage 6: Interactive TUI ──\n")
+
+    # -- §6.1 Cache data model --
+
+    check("TL cache init zero",
+          ['_BSK-TL-N @ .'],
+          "0 ")
+
+    check("NF cache init zero",
+          ['_BSK-NF-N @ .'],
+          "0 ")
+
+    check("PR cache init zero",
+          ['_BSK-PR-OK @ .'],
+          "0 ")
+
+    check("Screen registered (10 total)",
+          ['NSCREENS @ .'],
+          "10 ")
+
+    # -- §6.2 Cache accessors: roundtrip store/fetch --
+
+    # Timeline handle
+    check("TL handle store/fetch",
+          ['TR', '65 TC 108 TC 105 TC 99 TC 101 TC',
+           'TA 0 _BSK-TL-H!',
+           '0 _BSK-TL-HANDLE TYPE'],
+          "Alice")
+
+    # Timeline text
+    check("TL text store/fetch",
+          ['TR', '72 TC 101 TC 108 TC 108 TC 111 TC',
+           'TA 1 _BSK-TL-T!',
+           '1 _BSK-TL-TEXT TYPE'],
+          "Hello")
+
+    # Timeline URI store/fetch
+    check("TL URI store/fetch",
+          ['TR',
+           '97 TC 116 TC 58 TC 47 TC 47 TC',
+           '100 TC 105 TC 100 TC',
+           'TA 2 _BSK-TL-U!',
+           '2 _BSK-TL-URI TYPE'],
+          "at://did")
+
+    # Timeline CID store/fetch
+    check("TL CID store/fetch",
+          ['TR',
+           '98 TC 97 TC 102 TC 121 TC',
+           'TA 0 _BSK-TL-C!',
+           '0 _BSK-TL-CID TYPE'],
+          "bafy")
+
+    # Notification reason store/fetch
+    check("NF reason store/fetch",
+          ['TR', '108 TC 105 TC 107 TC 101 TC',
+           'TA 0 _BSK-NF-R!',
+           '0 _BSK-NF-REASON TYPE'],
+          "like")
+
+    # Notification handle store/fetch
+    check("NF handle store/fetch",
+          ['TR', '98 TC 111 TC 98 TC',
+           'TA 3 _BSK-NF-H!',
+           '3 _BSK-NF-HANDLE TYPE'],
+          "bob")
+
+    # Multiple slots don't interfere
+    check("TL slot isolation",
+          ['TR 65 TC TA 0 _BSK-TL-H!',
+           'TR 66 TC TA 1 _BSK-TL-H!',
+           'TR 67 TC TA 2 _BSK-TL-H!',
+           ': _TISO 0 _BSK-TL-HANDLE TYPE ." |" 1 _BSK-TL-HANDLE TYPE ." |" 2 _BSK-TL-HANDLE TYPE ; _TISO'],
+          "A|B|C")
+
+    # Truncation: slot size _BSK-HS=32
+    check("TL handle truncation",
+          ['TR',
+           '65 TC 66 TC 67 TC 68 TC 69 TC 70 TC 71 TC 72 TC',
+           '65 TC 66 TC 67 TC 68 TC 69 TC 70 TC 71 TC 72 TC',
+           '65 TC 66 TC 67 TC 68 TC 69 TC 70 TC 71 TC 72 TC',
+           '65 TC 66 TC 67 TC 68 TC 69 TC 70 TC 71 TC 72 TC',
+           '65 TC 66 TC 67 TC 68 TC',
+           'TA 4 _BSK-TL-H!',
+           '4 _BSK-TL-HANDLE DUP .'],
+          "32 ")
+
+    # -- §6.2 Status message --
+
+    check("Set/get status",
+          ['TR 79 TC 75 TC',
+           'TA _BSK-SET-STATUS',
+           '_BSK-STATUS _BSK-STATUS-LEN @ TYPE'],
+          "OK")
+
+    check("Clear status",
+          ['TR 79 TC 75 TC TA _BSK-SET-STATUS',
+           '_BSK-CLR-STATUS',
+           '_BSK-STATUS-LEN @ .'],
+          "0 ")
+
+    # -- §6.3 Cache item parser --
+
+    check("TL cache item parse",
+          jstr('{"post":{"uri":"at://did:plc:test/app.bsky.feed.post/abc","cid":"bafytest","author":{"handle":"alice.test"},"record":{"text":"Hello world"}}}') +
+          ['TA 0 _BSK-TL-CACHE-ITEM',
+           ': _TCIP 0 _BSK-TL-HANDLE TYPE ." |" 0 _BSK-TL-TEXT TYPE ." |" 0 _BSK-TL-URI TYPE ." |" 0 _BSK-TL-CID TYPE ; _TCIP'],
+          None,
+          lambda out: 'alice.test|Hello world|at://did:plc:test/app.bsky.feed.post/abc|bafytest' in out)
+
+    check("NF cache item parse",
+          jstr('{"reason":"follow","author":{"handle":"bob.bsky.social"}}') +
+          ['TA 0 _BSK-NF-CACHE-ITEM',
+           ': _TNIP 0 _BSK-NF-REASON TYPE ." |" 0 _BSK-NF-HANDLE TYPE ; _TNIP'],
+          None,
+          lambda out: 'follow|bob.bsky.social' in out)
+
+    # -- §6.4 Row renderers --
+
+    check("TL row renderer",
+          jstr('{"post":{"uri":"at://x","cid":"c","author":{"handle":"alice.test"},"record":{"text":"My first post"}}}') +
+          ['TA 0 _BSK-TL-CACHE-ITEM',
+           '1 _BSK-TL-N !',
+           '0 .BSK-TL-ROW'],
+          None,
+          lambda out: '@alice.test' in out and 'My first post' in out)
+
+    check("NF row renderer",
+          jstr('{"reason":"like","author":{"handle":"charlie.bsky.social"}}') +
+          ['TA 0 _BSK-NF-CACHE-ITEM',
+           '1 _BSK-NF-N !',
+           '0 .BSK-NF-ROW'],
+          None,
+          lambda out: 'like' in out and '@charlie.bsky.social' in out)
+
+    # -- §6.5 Screen renderers --
+
+    check("TL screen empty",
+          ['0 _BSK-TL-N !',
+           'SCR-BSKY-TL'],
+          None,
+          lambda out: 'Timeline' in out and 'fetch' in out.lower())
+
+    check("TL screen with data",
+          jstr('{"post":{"uri":"at://x","cid":"c","author":{"handle":"alice.test"},"record":{"text":"Test post"}}}') +
+          ['TA 0 _BSK-TL-CACHE-ITEM',
+           '1 _BSK-TL-N !',
+           '0 SCR-SEL !',
+           'SCR-BSKY-TL'],
+          None,
+          lambda out: 'Timeline' in out and '@alice.test' in out)
+
+    check("NF screen empty",
+          ['0 _BSK-NF-N !',
+           'SCR-BSKY-NF'],
+          None,
+          lambda out: 'Notifications' in out and 'fetch' in out.lower())
+
+    check("PR screen empty",
+          ['0 _BSK-PR-OK !',
+           'SCR-BSKY-PR'],
+          None,
+          lambda out: 'Profile' in out and 'fetch' in out.lower())
+
+    # -- §6.6 Key handler --
+
+    check("Unknown key not consumed",
+          ['0 SUBSCREEN-ID !',
+           ': TKX  120 BSKY-KEYS . ; TKX'],
+          "0 ")
+
+    check("Key l not consumed on notifs sub",
+          ['1 SUBSCREEN-ID !',
+           ': TKL2  108 BSKY-KEYS . ; TKL2'],
+          "0 ")
+
+    # -- §6.7 Registration --
+
+    check("Bsky screen selectable",
+          ['_BSK-SCR-ID @ CELLS SCR-FLAGS + @ .'],
+          "1 ")
+
+    check("Bsky has 3 subscreens",
+          ['_BSK-SCR-ID @ CELLS SUB-COUNTS + @ .'],
+          "3 ")
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -1140,6 +1329,8 @@ def main():
     test_stage4()
     print()
     test_stage5()
+    print()
+    test_stage6()
 
     print()
     print("=" * 60)

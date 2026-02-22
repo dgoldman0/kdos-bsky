@@ -6,8 +6,9 @@
 \   BSK-    public API words
 \   _BSK-   internal helpers
 \
-\ Load with:   S" bsky.f" INCLUDED
-\         or:  SCROLL-LOAD http://host/bsky.f
+\ Load with:   REQUIRE bsky.f
+
+PROVIDED bsky.f
 
 \ =====================================================================
 \  §0  Foundation Utilities
@@ -1152,7 +1153,7 @@ VARIABLE BSK-TL-CURSOR-LEN  0 BSK-TL-CURSOR-LEN !
 \   If a cursor is stored, appends &cursor=<cursor>.
 : _BSK-TL-PATH  ( -- addr len )
     BSK-RESET
-    S" /xrpc/app.bsky.feed.getTimeline?limit=5" BSK-APPEND
+    S" /xrpc/app.bsky.feed.getTimeline?limit=10" BSK-APPEND
     BSK-TL-CURSOR-LEN @ 0> IF
         S" &cursor=" BSK-APPEND
         BSK-TL-CURSOR BSK-TL-CURSOR-LEN @ URL-ENCODE
@@ -1652,4 +1653,532 @@ VARIABLE _BUP-S2     VARIABLE _BUP-S1
 
 \ =====================================================================
 \  §5 — End of Write Features
+\ =====================================================================
+
+\ =====================================================================
+\  §6  Interactive TUI (KDOS Screens Integration)
+\ =====================================================================
+\
+\  Registers a Bluesky screen [9] with three subscreens:
+\    [Timeline]  [Notifs]  [Profile]
+\
+\  The screen is selectable (flag=1) — n/p navigates posts/items,
+\  Enter activates.  Per-screen key handler:
+\    f = fetch/refresh   l = like   t = repost   d = delete
+\    c = compose post    y = reply to selected post
+\
+\  Data is cached in fixed-size arrays to avoid re-fetching on each
+\  screen redraw.  Press 'f' to fetch fresh data from the API.
+
+\ ── §6.1  Cache Data Model ────────────────────────────────────────
+\
+\  Fixed-size slot arrays for timeline posts, notifications, and
+\  profile data.  Separate length arrays track actual stored length
+\  per slot.
+
+10 CONSTANT _BSK-TL-MAX      \ max cached timeline posts
+32 CONSTANT _BSK-HS          \ handle slot size (bytes)
+300 CONSTANT _BSK-TS         \ text slot size
+100 CONSTANT _BSK-US         \ URI slot size
+64 CONSTANT _BSK-CS          \ CID slot size
+
+\ Timeline post cache arrays
+CREATE _BSK-TL-H   _BSK-TL-MAX _BSK-HS * ALLOT    \ handles
+CREATE _BSK-TL-HL  _BSK-TL-MAX CELLS ALLOT         \ handle lengths
+CREATE _BSK-TL-T   _BSK-TL-MAX _BSK-TS * ALLOT    \ post texts
+CREATE _BSK-TL-TL  _BSK-TL-MAX CELLS ALLOT         \ text lengths
+CREATE _BSK-TL-U   _BSK-TL-MAX _BSK-US * ALLOT    \ AT URIs
+CREATE _BSK-TL-UL  _BSK-TL-MAX CELLS ALLOT         \ URI lengths
+CREATE _BSK-TL-C   _BSK-TL-MAX _BSK-CS * ALLOT    \ CIDs
+CREATE _BSK-TL-CL  _BSK-TL-MAX CELLS ALLOT         \ CID lengths
+VARIABLE _BSK-TL-N   0 _BSK-TL-N !                 \ cached count
+
+\ Notification cache arrays
+10 CONSTANT _BSK-NF-MAX
+20 CONSTANT _BSK-RS           \ reason slot size
+
+CREATE _BSK-NF-R   _BSK-NF-MAX _BSK-RS * ALLOT    \ reasons
+CREATE _BSK-NF-RL  _BSK-NF-MAX CELLS ALLOT         \ reason lengths
+CREATE _BSK-NF-H   _BSK-NF-MAX _BSK-HS * ALLOT    \ author handles
+CREATE _BSK-NF-HL  _BSK-NF-MAX CELLS ALLOT         \ handle lengths
+VARIABLE _BSK-NF-N   0 _BSK-NF-N !                 \ cached count
+
+\ Profile cache
+CREATE _BSK-PR-DN   64 ALLOT   VARIABLE _BSK-PR-DNL  0 _BSK-PR-DNL !
+CREATE _BSK-PR-H    40 ALLOT   VARIABLE _BSK-PR-HL   0 _BSK-PR-HL !
+CREATE _BSK-PR-D   200 ALLOT   VARIABLE _BSK-PR-DL   0 _BSK-PR-DL !
+VARIABLE _BSK-PR-FC  0 _BSK-PR-FC !    \ followersCount
+VARIABLE _BSK-PR-FG  0 _BSK-PR-FG !    \ followsCount
+VARIABLE _BSK-PR-PC  0 _BSK-PR-PC !    \ postsCount
+VARIABLE _BSK-PR-OK  0 _BSK-PR-OK !    \ profile loaded?
+
+\ Compose buffer
+CREATE _BSK-COMP-BUF 300 ALLOT
+
+\ Status message for feedback
+CREATE _BSK-STATUS 64 ALLOT
+VARIABLE _BSK-STATUS-LEN  0 _BSK-STATUS-LEN !
+
+\ ── §6.2  Cache Accessors ─────────────────────────────────────────
+\
+\  Store:  _BSK-TL-H!  ( addr len i -- )   copy string into slot i
+\  Fetch:  _BSK-TL-HANDLE  ( i -- addr len )   return pointer+length
+
+VARIABLE _BSK-CI   \ cache index temp
+
+\ Timeline handle
+: _BSK-TL-H!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-HS MIN DUP _BSK-CI @ CELLS _BSK-TL-HL + !
+    _BSK-CI @ _BSK-HS * _BSK-TL-H + SWAP CMOVE ;
+: _BSK-TL-HANDLE  ( i -- addr len )
+    DUP _BSK-HS * _BSK-TL-H +  SWAP CELLS _BSK-TL-HL + @ ;
+
+\ Timeline text
+: _BSK-TL-T!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-TS MIN DUP _BSK-CI @ CELLS _BSK-TL-TL + !
+    _BSK-CI @ _BSK-TS * _BSK-TL-T + SWAP CMOVE ;
+: _BSK-TL-TEXT  ( i -- addr len )
+    DUP _BSK-TS * _BSK-TL-T +  SWAP CELLS _BSK-TL-TL + @ ;
+
+\ Timeline URI
+: _BSK-TL-U!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-US MIN DUP _BSK-CI @ CELLS _BSK-TL-UL + !
+    _BSK-CI @ _BSK-US * _BSK-TL-U + SWAP CMOVE ;
+: _BSK-TL-URI  ( i -- addr len )
+    DUP _BSK-US * _BSK-TL-U +  SWAP CELLS _BSK-TL-UL + @ ;
+
+\ Timeline CID
+: _BSK-TL-C!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-CS MIN DUP _BSK-CI @ CELLS _BSK-TL-CL + !
+    _BSK-CI @ _BSK-CS * _BSK-TL-C + SWAP CMOVE ;
+: _BSK-TL-CID  ( i -- addr len )
+    DUP _BSK-CS * _BSK-TL-C +  SWAP CELLS _BSK-TL-CL + @ ;
+
+\ Notification reason
+: _BSK-NF-R!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-RS MIN DUP _BSK-CI @ CELLS _BSK-NF-RL + !
+    _BSK-CI @ _BSK-RS * _BSK-NF-R + SWAP CMOVE ;
+: _BSK-NF-REASON  ( i -- addr len )
+    DUP _BSK-RS * _BSK-NF-R +  SWAP CELLS _BSK-NF-RL + @ ;
+
+\ Notification handle
+: _BSK-NF-H!  ( addr len i -- )
+    _BSK-CI !
+    _BSK-HS MIN DUP _BSK-CI @ CELLS _BSK-NF-HL + !
+    _BSK-CI @ _BSK-HS * _BSK-NF-H + SWAP CMOVE ;
+: _BSK-NF-HANDLE  ( i -- addr len )
+    DUP _BSK-HS * _BSK-NF-H +  SWAP CELLS _BSK-NF-HL + @ ;
+
+\ Status message
+: _BSK-SET-STATUS  ( addr len -- )
+    64 MIN DUP _BSK-STATUS-LEN !
+    _BSK-STATUS SWAP CMOVE ;
+: _BSK-CLR-STATUS  ( -- )  0 _BSK-STATUS-LEN ! ;
+
+\ ── §6.3  Fetch & Populate ────────────────────────────────────────
+\
+\  Fetch data from the API, parse JSON, fill cache arrays.
+
+\ _BSK-TL-CACHE-ITEM ( item-addr item-len idx -- )
+\   Parse one feed item JSON and cache handle, text, URI, CID.
+VARIABLE _BSK-FI
+
+: _BSK-TL-CACHE-ITEM  ( addr len idx -- )
+    _BSK-FI !
+    \ Navigate to "post" object within feed item
+    2DUP S" post" JSON-FIND-KEY
+    DUP 0= IF 2DROP 2DROP EXIT THEN
+    \ Cache post.uri
+    2DUP S" uri" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-TL-U!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache post.cid
+    2DUP S" cid" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-TL-C!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache author.handle (within post scope)
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-TL-H!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache record.text (within post scope)
+    2DUP S" text" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-TL-T!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    2DROP       \ drop post scope
+    2DROP ;     \ drop item scope
+
+\ _BSK-TL-FETCH ( -- )   Fetch timeline and populate cache.
+: _BSK-TL-FETCH  ( -- )
+    BSK-ACCESS-LEN @ 0= IF
+        S" Not logged in" _BSK-SET-STATUS EXIT
+    THEN
+    _BSK-TL-PATH BSK-GET
+    DUP 0= IF 2DROP
+        S" Fetch failed" _BSK-SET-STATUS EXIT
+    THEN
+    BSK-HTTP-STATUS @ 200 <> IF 2DROP
+        S" HTTP error" _BSK-SET-STATUS EXIT
+    THEN
+    \ Save cursor for pagination
+    2DUP S" cursor" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 128 <= IF
+            DUP BSK-TL-CURSOR-LEN !
+            BSK-TL-CURSOR SWAP CMOVE
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Reset cache
+    0 _BSK-TL-N !
+    \ Navigate to feed array
+    2DUP S" feed" JSON-FIND-KEY
+    DUP 0= IF 2DROP 2DROP
+        S" No feed data" _BSK-SET-STATUS EXIT
+    THEN
+    JSON-SKIP-WS
+    OVER C@ 91 <> IF 2DROP 2DROP EXIT THEN
+    1 /STRING JSON-SKIP-WS
+    \ Iterate items, cache up to _BSK-TL-MAX
+    BEGIN
+        DUP 0> IF OVER C@ 93 <> ELSE 0 THEN
+        _BSK-TL-N @ _BSK-TL-MAX < AND
+    WHILE
+        2DUP _BSK-TL-N @ _BSK-TL-CACHE-ITEM
+        1 _BSK-TL-N +!
+        JSON-SKIP-VALUE
+        JSON-SKIP-WS
+        DUP 0> IF
+            OVER C@ 44 = IF 1 /STRING JSON-SKIP-WS THEN
+        THEN
+    REPEAT
+    2DROP 2DROP
+    S" Timeline loaded" _BSK-SET-STATUS ;
+
+\ _BSK-NF-CACHE-ITEM ( item-addr item-len idx -- )
+\   Parse one notification and cache reason + handle.
+: _BSK-NF-CACHE-ITEM  ( addr len idx -- )
+    _BSK-FI !
+    \ Cache reason
+    2DUP S" reason" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-NF-R!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache author.handle
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF _BSK-FI @ _BSK-NF-H!
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    2DROP ;
+
+\ _BSK-NF-FETCH ( -- )   Fetch notifications and populate cache.
+: _BSK-NF-FETCH  ( -- )
+    BSK-ACCESS-LEN @ 0= IF
+        S" Not logged in" _BSK-SET-STATUS EXIT
+    THEN
+    BSK-RESET
+    S" /xrpc/app.bsky.notification.listNotifications?limit=10" BSK-APPEND
+    _BSK-SAVE-PATH BSK-GET
+    DUP 0= IF 2DROP
+        S" Fetch failed" _BSK-SET-STATUS EXIT
+    THEN
+    BSK-HTTP-STATUS @ 200 <> IF 2DROP
+        S" HTTP error" _BSK-SET-STATUS EXIT
+    THEN
+    0 _BSK-NF-N !
+    2DUP S" notifications" JSON-FIND-KEY
+    DUP 0= IF 2DROP 2DROP
+        S" No notifications" _BSK-SET-STATUS EXIT
+    THEN
+    JSON-SKIP-WS
+    OVER C@ 91 <> IF 2DROP 2DROP EXIT THEN
+    1 /STRING JSON-SKIP-WS
+    BEGIN
+        DUP 0> IF OVER C@ 93 <> ELSE 0 THEN
+        _BSK-NF-N @ _BSK-NF-MAX < AND
+    WHILE
+        2DUP _BSK-NF-N @ _BSK-NF-CACHE-ITEM
+        1 _BSK-NF-N +!
+        JSON-SKIP-VALUE
+        JSON-SKIP-WS
+        DUP 0> IF
+            OVER C@ 44 = IF 1 /STRING JSON-SKIP-WS THEN
+        THEN
+    REPEAT
+    2DROP 2DROP
+    S" Notifications loaded" _BSK-SET-STATUS ;
+
+\ _BSK-PR-FETCH ( -- )   Fetch own profile and populate cache.
+: _BSK-PR-FETCH  ( -- )
+    BSK-ACCESS-LEN @ 0= IF
+        S" Not logged in" _BSK-SET-STATUS EXIT
+    THEN
+    BSK-DID BSK-DID-LEN @ _BSK-PROFILE-PATH BSK-GET
+    DUP 0= IF 2DROP
+        S" Fetch failed" _BSK-SET-STATUS EXIT
+    THEN
+    BSK-HTTP-STATUS @ 200 <> IF 2DROP
+        S" HTTP error" _BSK-SET-STATUS EXIT
+    THEN
+    \ Cache displayName
+    2DUP S" displayName" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF
+            64 MIN DUP _BSK-PR-DNL !
+            _BSK-PR-DN SWAP CMOVE
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache handle
+    2DUP S" handle" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF
+            40 MIN DUP _BSK-PR-HL !
+            _BSK-PR-H SWAP CMOVE
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache description
+    2DUP S" description" JSON-FIND-KEY
+    DUP 0> IF
+        JSON-GET-STRING DUP 0> IF
+            200 MIN DUP _BSK-PR-DL !
+            _BSK-PR-D SWAP CMOVE
+        ELSE 2DROP THEN
+    ELSE 2DROP THEN
+    \ Cache numeric stats
+    2DUP S" followersCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER _BSK-PR-FC ! ELSE 2DROP THEN
+    2DUP S" followsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER _BSK-PR-FG ! ELSE 2DROP THEN
+    2DUP S" postsCount" JSON-FIND-KEY
+    DUP 0> IF JSON-GET-NUMBER _BSK-PR-PC ! ELSE 2DROP THEN
+    2DROP
+    -1 _BSK-PR-OK !
+    S" Profile loaded" _BSK-SET-STATUS ;
+
+\ ── §6.4  Row Renderers ───────────────────────────────────────────
+\
+\  Called by W.LIST for each item.  Signature: ( i -- )
+
+\ .BSK-TL-ROW ( i -- )   Print one timeline post row.
+: .BSK-TL-ROW  ( i -- )
+    DUP _BSK-TL-HANDLE
+    DUP 0> IF
+        ." @" 20 _BSK-TYPE-TRUNC
+    ELSE 2DROP THEN
+    ."  "
+    _BSK-TL-TEXT
+    DUP 0> IF
+        50 _BSK-TYPE-TRUNC
+    ELSE 2DROP THEN ;
+
+\ .BSK-NF-ROW ( i -- )   Print one notification row.
+: .BSK-NF-ROW  ( i -- )
+    DUP _BSK-NF-REASON
+    DUP 0> IF
+        18 _BSK-TYPE-TRUNC
+    ELSE 2DROP THEN
+    ."  @"
+    _BSK-NF-HANDLE
+    DUP 0> IF
+        40 _BSK-TYPE-TRUNC
+    ELSE 2DROP THEN ;
+
+\ .BSK-TL-DETAIL ( -- )   Show detail for selected timeline post.
+: .BSK-TL-DETAIL  ( -- )
+    SCR-SEL @
+    DUP _BSK-TL-HANDLE
+    DUP 0> IF
+        BOLD ."   @" TYPE RESET-COLOR CR
+    ELSE 2DROP THEN
+    DUP _BSK-TL-TEXT
+    DUP 0> IF
+        CR ."   " TYPE CR
+    ELSE 2DROP THEN
+    CR
+    _BSK-TL-URI
+    DUP 0> IF
+        DIM ."   " 78 _BSK-TYPE-TRUNC RESET-COLOR CR
+    ELSE 2DROP THEN
+    S" [l]Like [t]Repost [y]Reply [d]Delete [c]Compose" W.HINT ;
+
+\ ── §6.5  Screen Renderers ────────────────────────────────────────
+\
+\  Each subscreen is a word that calls W.xxx widgets.
+
+\ Profile value printers (for W.KV-XT)
+: .BSK-PR-DN  ( -- )  _BSK-PR-DN _BSK-PR-DNL @ TYPE ;
+: .BSK-PR-HA  ( -- )  ." @" _BSK-PR-H _BSK-PR-HL @ TYPE ;
+
+\ SCR-BSKY-TL ( -- )   Timeline subscreen
+: SCR-BSKY-TL  ( -- )
+    _BSK-TL-N @ 0= IF
+        S" Timeline" W.TITLE
+        S" Press [f] to fetch" W.HINT
+    ELSE
+        _BSK-TL-N @ S" Timeline" W.TITLE-N
+        _BSK-TL-N @ ['] .BSK-TL-ROW W.LIST
+        _BSK-TL-N @ ['] .BSK-TL-DETAIL W.DETAIL
+    THEN
+    _BSK-STATUS-LEN @ 0> IF
+        W.GAP
+        _BSK-STATUS _BSK-STATUS-LEN @ W.HINT
+    THEN ;
+
+\ SCR-BSKY-NF ( -- )   Notifications subscreen
+: SCR-BSKY-NF  ( -- )
+    _BSK-NF-N @ 0= IF
+        S" Notifications" W.TITLE
+        S" Press [f] to fetch" W.HINT
+    ELSE
+        _BSK-NF-N @ S" Notifications" W.TITLE-N
+        _BSK-NF-N @ ['] .BSK-NF-ROW W.LIST
+    THEN
+    _BSK-STATUS-LEN @ 0> IF
+        W.GAP
+        _BSK-STATUS _BSK-STATUS-LEN @ W.HINT
+    THEN ;
+
+\ SCR-BSKY-PR ( -- )   Profile subscreen
+: SCR-BSKY-PR  ( -- )
+    _BSK-PR-OK @ 0= IF
+        S" Profile" W.TITLE
+        S" Press [f] to fetch" W.HINT
+    ELSE
+        S" Profile" W.TITLE
+        ['] .BSK-PR-DN S" Name" W.KV-XT
+        ['] .BSK-PR-HA S" Handle" W.KV-XT
+        _BSK-PR-FC @ S" Followers" W.KV
+        _BSK-PR-FG @ S" Following" W.KV
+        _BSK-PR-PC @ S" Posts" W.KV
+        W.GAP
+        _BSK-PR-DL @ 0> IF
+            S" Bio" W.SECTION
+            _BSK-PR-D _BSK-PR-DL @ W.LINE
+        THEN
+    THEN
+    _BSK-STATUS-LEN @ 0> IF
+        W.GAP
+        _BSK-STATUS _BSK-STATUS-LEN @ W.HINT
+    THEN ;
+
+\ SCR-BSKY ( -- )   Main screen (fallback if no subscreens)
+: SCR-BSKY  ( -- )
+    SCR-BSKY-TL ;
+
+\ ── §6.6  Key Handler & Actions ──────────────────────────────────
+\
+\  BSKY-KEYS ( c -- consumed )
+\  Per-screen key handler.  Priority dispatch via CALL-SCREEN-KEY.
+
+\ _BSK-ACT-LIKE ( -- )   Like the selected post
+: _BSK-ACT-LIKE  ( -- )
+    SCR-SEL @ DUP -1 <> OVER _BSK-TL-N @ < AND IF
+        DUP _BSK-TL-URI ROT _BSK-TL-CID
+        BSK-LIKE
+        S" Liked!" _BSK-SET-STATUS
+    ELSE DROP THEN ;
+
+\ _BSK-ACT-REPOST ( -- )   Repost the selected post
+: _BSK-ACT-REPOST  ( -- )
+    SCR-SEL @ DUP -1 <> OVER _BSK-TL-N @ < AND IF
+        DUP _BSK-TL-URI ROT _BSK-TL-CID
+        BSK-REPOST
+        S" Reposted!" _BSK-SET-STATUS
+    ELSE DROP THEN ;
+
+\ _BSK-ACT-DELETE ( -- )   Delete the selected post
+: _BSK-ACT-DELETE  ( -- )
+    SCR-SEL @ DUP -1 <> OVER _BSK-TL-N @ < AND IF
+        _BSK-TL-URI BSK-DELETE
+        S" Deleted!" _BSK-SET-STATUS
+    ELSE DROP THEN ;
+
+\ _BSK-ACT-REPLY ( -- )   Reply to the selected post
+: _BSK-ACT-REPLY  ( -- )
+    SCR-SEL @ DUP -1 <> OVER _BSK-TL-N @ < AND IF
+        DUP _BSK-TL-URI ROT _BSK-TL-CID
+        _BSK-COMP-BUF 280 S" Reply> " W.INPUT
+        DUP 0> IF
+            _BSK-COMP-BUF SWAP BSK-REPLY
+            S" Replied!" _BSK-SET-STATUS
+        ELSE DROP 2DROP 2DROP THEN
+    ELSE DROP THEN ;
+
+\ _BSK-ACT-COMPOSE ( -- )   Compose a new post
+: _BSK-ACT-COMPOSE  ( -- )
+    _BSK-COMP-BUF 280 S" Post> " W.INPUT
+    DUP 0> IF
+        _BSK-COMP-BUF SWAP BSK-POST
+        S" Posted!" _BSK-SET-STATUS
+    ELSE DROP THEN ;
+
+\ BSKY-KEYS ( c -- consumed )
+\   Key handler for the Bluesky screen.
+: BSKY-KEYS  ( c -- consumed )
+    \ 'f' = fetch/refresh (subscreen-dependent)
+    DUP 102 = IF DROP
+        SUBSCREEN-ID @ 0 = IF _BSK-TL-FETCH THEN
+        SUBSCREEN-ID @ 1 = IF _BSK-NF-FETCH THEN
+        SUBSCREEN-ID @ 2 = IF _BSK-PR-FETCH THEN
+        RENDER-SCREEN -1 EXIT
+    THEN
+    \ 'c' = compose (any subscreen)
+    DUP 99 = IF DROP
+        _BSK-ACT-COMPOSE
+        RENDER-SCREEN -1 EXIT
+    THEN
+    \ Post actions (timeline subscreen only)
+    SUBSCREEN-ID @ 0 <> IF DROP 0 EXIT THEN
+    \ 'l' = like
+    DUP 108 = IF DROP
+        _BSK-ACT-LIKE RENDER-SCREEN -1 EXIT
+    THEN
+    \ 't' = repost
+    DUP 116 = IF DROP
+        _BSK-ACT-REPOST RENDER-SCREEN -1 EXIT
+    THEN
+    \ 'd' = delete
+    DUP 100 = IF DROP
+        _BSK-ACT-DELETE RENDER-SCREEN -1 EXIT
+    THEN
+    \ 'y' = reply
+    DUP 121 = IF DROP
+        _BSK-ACT-REPLY RENDER-SCREEN -1 EXIT
+    THEN
+    DROP 0 ;       \ not consumed
+
+\ ── §6.7  Screen Registration ─────────────────────────────────────
+\
+\  Register Bluesky as screen [9] with three subscreens.
+
+: LBL-BSKY     ." Bsky" ;
+: LBL-BSKY-TL  ." Timeline" ;
+: LBL-BSKY-NF  ." Notifs" ;
+: LBL-BSKY-PR  ." Profile" ;
+
+VARIABLE _BSK-SCR-ID
+
+' SCR-BSKY ' LBL-BSKY 1 REGISTER-SCREEN _BSK-SCR-ID !
+
+' BSKY-KEYS _BSK-SCR-ID @ SET-SCREEN-KEYS
+
+' SCR-BSKY-TL ' LBL-BSKY-TL _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-NF ' LBL-BSKY-NF _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-PR ' LBL-BSKY-PR _BSK-SCR-ID @ ADD-SUBSCREEN
+
+\ =====================================================================
+\  §6 — End of Interactive TUI
 \ =====================================================================
