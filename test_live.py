@@ -473,37 +473,70 @@ def main():
                 continue
             print(f"  {line[:160]}")
 
-        # ── Stage 5 live test: BSK-POST ──────────────────────────────
-        print("\n--- Stage 5: BSK-POST (live post) ---")
+        # ── Stage 5 live test: Post + Delete ─────────────────────────
+        print("\n--- Stage 5: Post + Delete (round-trip test) ---")
         buf.clear()
-        # Use a timestamped test message so we can find it
         import datetime
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        test_msg = f"megapad-64 bsky.f live test [{ts}]"
-        # Escape for Forth S" string (no special chars needed here)
+        test_msg = f"megapad-64 test [{ts}] (auto-delete)"
+        # Use low-level words so we can capture the URI from createRecord
+        # response, then feed it to BSK-DELETE.
         feed_lines(sys_obj, buf, [
-            f': _POSTTEST',
-            f'  S" {test_msg}" BSK-POST',
+            'CREATE _CR-URI 256 ALLOT  VARIABLE _CR-ULEN',
+            ': _POSTDEL-TEST',
+            # Build the post JSON
+            f'  S" app.bsky.feed.post" _BSK-CR-OPEN',
+            f'  S" text" _BSK-QK',
+            f'  S" {test_msg}" _BSK-QV-ESC',
+            f'  _BSK-COMMA _BSK-CREATED-AT _BSK-CR-CLOSE',
+            # Stage body and POST
+            f'  _BSK-STAGE-BODY',
+            f'  S" /xrpc/com.atproto.repo.createRecord"',
+            f'  _BSK-POST-BUF _BSK-POST-LEN @',
+            f'  BSK-POST-JSON',
+            # Check response
+            f'  DUP 0= IF 2DROP ." [POST-FAIL-NET]" CR ." ##PDONE##" CR EXIT THEN',
             f'  ." [POST-STATUS] " BSK-HTTP-STATUS @ . CR',
-            f'  ." ##POST-DONE##" CR ;',
+            f'  BSK-HTTP-STATUS @ 200 <> IF 2DROP ." [POST-FAIL-HTTP]" CR ." ##PDONE##" CR EXIT THEN',
+            # Response body is on stack ( addr len ) — extract URI
+            f'  2DUP S" uri" JSON-FIND-KEY',
+            f'  DUP 0> IF',
+            f'    JSON-GET-STRING DUP 0> IF',
+            # ( str-addr str-len ) — save str-addr, compute clamped len
+            f'      256 MIN DUP _CR-ULEN !',
+            # ( str-addr clamped-len )
+            f'      _CR-URI SWAP CMOVE',
+            f'      ." [POST-URI] " _CR-URI _CR-ULEN @ TYPE CR',
+            f'    ELSE 2DROP ." [GS-EMPTY]" CR THEN',
+            f'  ELSE 2DROP ." [POST-NO-URI]" CR THEN',
+            f'  2DROP',
+            # Now delete the post using the captured URI
+            f'  _CR-ULEN @ 0= IF ." [DEL-SKIP]" CR ." ##PDONE##" CR EXIT THEN',
+            f'  ." Deleting..." CR',
+            f'  _CR-URI _CR-ULEN @ BSK-DELETE',
+            f'  ." [DEL-STATUS] " BSK-HTTP-STATUS @ . CR',
+            f'  ." ##PDONE##" CR ;',
         ])
         buf.clear()
         print(f'  Posting: "{test_msg}"')
-        steps = run_net_command(sys_obj, buf, ['_POSTTEST'],
-                               timeout_sec=120, sentinel="##POST-DONE")
-        post_text = uart_text(buf)
-        stage4_results['BSK-POST'] = post_text
+        print(f'  Then immediately deleting it...')
+        steps = run_net_command(sys_obj, buf, ['_POSTDEL-TEST'],
+                               timeout_sec=180, sentinel="##PDONE")
+        pd_text = uart_text(buf)
+        stage4_results['POST+DELETE'] = pd_text
         print(f"  Completed in {steps:,} steps")
-        for line in post_text.strip().split("\n"):
+        for line in pd_text.strip().split("\n"):
             line = line.strip()
             if not line or line == 'ok' or line.startswith('>'):
                 continue
             print(f"  {line[:160]}")
 
-        if "Posted!" in post_text:
-            print("\n  *** SUCCESS: BSK-POST created a skeet! ***")
+        if "Deleted!" in pd_text:
+            print("\n  *** SUCCESS: Post created and deleted! ***")
+        elif "[POST-URI]" in pd_text:
+            print("\n  *** PARTIAL: Posted but delete may have failed ***")
         else:
-            print("\n  *** FAILED: BSK-POST did not succeed ***")
+            print("\n  *** FAILED: Post+Delete did not succeed ***")
 
     else:
         print("\n--- Stage 4+5 live tests SKIPPED (login required) ---")

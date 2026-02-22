@@ -1026,6 +1026,78 @@ def test_stage5():
            ': _T _BSK-STAGE-BODY _BSK-POST-BUF _BSK-POST-LEN @ TYPE ; _T'],
           "hello")
 
+    # §5.5 — BSK-FOLLOW JSON body
+    check("BSK-FOLLOW builds correct JSON",
+          did_setup +
+          [': _T S" app.bsky.graph.follow" _BSK-CR-OPEN',
+           '  S" subject" _BSK-QK',
+           '  S" did:plc:target123" _BSK-QV',
+           '  _BSK-COMMA _BSK-CREATED-AT _BSK-CR-CLOSE',
+           '  BSK-TYPE ; _T'],
+          None,
+          lambda out: ('"collection":"app.bsky.graph.follow"' in out
+                      and '"subject":"did:plc:target123"' in out
+                      and '"createdAt":"' in out))
+
+    check("BSK-FOLLOW word exists",
+          [': _T S" test" BSK-FOLLOW ; '],
+          None,
+          lambda out: "login first" in out or "?" not in out)
+
+    check("BSK-UNFOLLOW word exists",
+          [': _T S" abc123" BSK-UNFOLLOW ; '],
+          None,
+          lambda out: "login first" in out or "?" not in out)
+
+    # §5.5 — _BSK-DR-OPEN (deleteRecord JSON builder)
+    check("_BSK-DR-OPEN builds deleteRecord JSON",
+          did_setup +
+          [': _T S" app.bsky.feed.post" S" 3abc123" _BSK-DR-OPEN',
+           '  BSK-TYPE ; _T'],
+          None,
+          lambda out: ('"repo":"did:plc:test123"' in out
+                      and '"collection":"app.bsky.feed.post"' in out
+                      and '"rkey":"3abc123"' in out))
+
+    # §5.6 — URI parser
+    check("_BSK-URI-PARSE basic AT-URI",
+          jstr('at://did:plc:abc/app.bsky.feed.post/3xyz') +
+          [': _T TA _BSK-URI-PARSE IF',
+           '  ." rkey=" TYPE CR ." col=" TYPE CR',
+           '  ELSE ." FAIL" THEN ; _T'],
+          None,
+          lambda out: 'rkey=3xyz' in out and 'col=app.bsky.feed.post' in out)
+
+    check("_BSK-URI-PARSE no slashes fails",
+          [': _T S" noslashes" _BSK-URI-PARSE IF',
+           '  ." OK" ELSE ." FAIL" THEN ; _T'],
+          "FAIL")
+
+    check("_BSK-RFIND-SLASH finds last slash",
+          [': _T S" a/b/c" _BSK-RFIND-SLASH . ; _T'],
+          "3")
+
+    check("_BSK-RFIND-SLASH no slash returns -1",
+          [': _T S" abc" _BSK-RFIND-SLASH . ; _T'],
+          "-1")
+
+    check("BSK-DELETE word exists",
+          [': _T S" at://x/y/z" BSK-DELETE ; '],
+          None,
+          lambda out: "login first" in out or "?" not in out)
+
+    # §5.6 — BSK-DELETE end-to-end JSON (via _BSK-URI-PARSE + _BSK-DR-OPEN)
+    check("BSK-DELETE parses URI and builds deleteRecord JSON",
+          did_setup +
+          jstr('at://did:plc:abc/app.bsky.feed.post/3xyz789') +
+          [': _T TA _BSK-URI-PARSE IF',
+           '  _BSK-DR-OPEN BSK-TYPE',
+           '  ELSE ." PARSE-FAIL" THEN ; _T'],
+          None,
+          lambda out: ('"repo":"did:plc:test123"' in out
+                      and '"collection":"app.bsky.feed.post"' in out
+                      and '"rkey":"3xyz789"' in out))
+
 
 # ---------------------------------------------------------------------------
 #  Main

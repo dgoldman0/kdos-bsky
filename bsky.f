@@ -1540,6 +1540,116 @@ VARIABLE _BSK-REPLY-CADDR   VARIABLE _BSK-REPLY-CLEN
         ." bsky: repost failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
     THEN ;
 
+\ ── §5.5  BSK-FOLLOW / BSK-UNFOLLOW ───────────────────────────────
+\
+\  BSK-FOLLOW ( did-addr did-len -- )
+\  Follow a user by DID.
+
+: BSK-FOLLOW  ( addr len -- )
+    S" app.bsky.graph.follow" _BSK-CR-OPEN
+    S" subject" _BSK-QK
+    _BSK-QV
+    _BSK-COMMA
+    _BSK-CREATED-AT
+    _BSK-CR-CLOSE
+    _BSK-DO-CREATE IF
+        ." Followed!" CR
+    ELSE
+        ." bsky: follow failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ _BSK-DO-DELETE ( -- ok? )  Stage body, POST deleteRecord, check.
+: _BSK-DO-DELETE  ( -- ok? )
+    BSK-ACCESS-LEN @ 0= IF
+        ." bsky: login first" CR 0 EXIT
+    THEN
+    _BSK-STAGE-BODY
+    S" /xrpc/com.atproto.repo.deleteRecord"
+    _BSK-POST-BUF _BSK-POST-LEN @
+    BSK-POST-JSON
+    DUP 0= IF 2DROP ." bsky: delete failed (network)" CR 0 EXIT THEN
+    2DROP
+    BSK-HTTP-STATUS @ 200 = ;
+
+\ _BSK-DR-OPEN ( collection-addr collection-len rkey-addr rkey-len -- )
+\   Build deleteRecord JSON: {"repo":"<DID>","collection":"...","rkey":"..."}
+: _BSK-DR-OPEN  ( caddr clen rkaddr rklen -- )
+    2>R
+    BSK-RESET
+    123 BSK-EMIT
+    S" repo" _BSK-QK
+    BSK-DID BSK-DID-LEN @ _BSK-QV  _BSK-COMMA
+    S" collection" _BSK-QK
+    _BSK-QV  _BSK-COMMA
+    S" rkey" _BSK-QK
+    2R> _BSK-QV
+    125 BSK-EMIT ;
+
+\ BSK-UNFOLLOW ( rkey-addr rkey-len -- )
+\   Unfollow by rkey (the record key of the follow record).
+: BSK-UNFOLLOW  ( addr len -- )
+    S" app.bsky.graph.follow" 2SWAP
+    _BSK-DR-OPEN
+    _BSK-DO-DELETE IF
+        ." Unfollowed!" CR
+    ELSE
+        ." bsky: unfollow failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
+\ ── §5.6  BSK-DELETE ──────────────────────────────────────────────
+\
+\  BSK-DELETE ( uri-addr uri-len -- )
+\  Delete a record by AT URI.
+\  AT URI format: at://did:plc:xxx/app.bsky.feed.post/3abc...
+\  We extract the collection and rkey from the last two path segments.
+
+\ _BSK-RFIND-SLASH ( addr len -- offset | -1 )
+\   Find the last '/' in string.  Returns offset from addr.
+: _BSK-RFIND-SLASH  ( addr len -- offset )
+    1- BEGIN
+        DUP 0< IF NIP EXIT THEN
+        2DUP + C@ 47 = IF NIP EXIT THEN
+        1-
+    AGAIN ;
+
+\ _BSK-URI-PARSE ( uri-addr uri-len -- col-a col-l rkey-a rkey-l ok? )
+\   Extract collection and rkey from AT URI.
+\   Returns addresses pointing into the original string.
+VARIABLE _BUP-ADDR   VARIABLE _BUP-LEN
+VARIABLE _BUP-S2     VARIABLE _BUP-S1
+
+: _BSK-URI-PARSE  ( uaddr ulen -- ca cl ra rl flag )
+    _BUP-LEN !  _BUP-ADDR !
+    \ Find last slash (separates collection/rkey)
+    _BUP-ADDR @  _BUP-LEN @  _BSK-RFIND-SLASH
+    DUP 0< IF 0 0 0 0 0 EXIT THEN
+    _BUP-S2 !
+    \ Find second-to-last slash (separates repo/collection)
+    _BUP-ADDR @  _BUP-S2 @  _BSK-RFIND-SLASH
+    DUP 0< IF 0 0 0 0 0 EXIT THEN
+    _BUP-S1 !
+    \ collection = addr+s1+1, length = s2-s1-1
+    _BUP-ADDR @ _BUP-S1 @ + 1+
+    _BUP-S2 @ _BUP-S1 @ - 1-
+    \ rkey = addr+s2+1, length = total-s2-1
+    _BUP-ADDR @ _BUP-S2 @ + 1+
+    _BUP-LEN @ _BUP-S2 @ - 1-
+    -1 ;
+
+\ BSK-DELETE ( uri-addr uri-len -- )
+\   Delete any record by AT-URI.
+: BSK-DELETE  ( uaddr ulen -- )
+    _BSK-URI-PARSE 0= IF
+        ." bsky: invalid AT-URI" CR EXIT
+    THEN
+    \ ( col-a col-l rkey-a rkey-l )
+    _BSK-DR-OPEN
+    _BSK-DO-DELETE IF
+        ." Deleted!" CR
+    ELSE
+        ." bsky: delete failed (HTTP " BSK-HTTP-STATUS @ . ." )" CR
+    THEN ;
+
 \ =====================================================================
 \  §5 — End of Write Features
 \ =====================================================================
