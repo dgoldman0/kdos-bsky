@@ -1678,7 +1678,7 @@ VARIABLE _BUP-S2     VARIABLE _BUP-S1
 
 10 CONSTANT _BSK-TL-MAX      \ max cached timeline posts
 32 CONSTANT _BSK-HS          \ handle slot size (bytes)
-300 CONSTANT _BSK-TS         \ text slot size
+600 CONSTANT _BSK-TS         \ text slot size (up to 300-char post + URLs)
 100 CONSTANT _BSK-US         \ URI slot size
 64 CONSTANT _BSK-CS          \ CID slot size
 
@@ -2030,7 +2030,7 @@ VARIABLE _BSK-FI
 \ Common hint bar for timeline subscreen
 : .BSK-TL-HINTS  ( -- )
     _BSK-TL-N @ 0> IF
-        S" [l]Like [t]Repost [y]Reply [d]Delete [c]Compose [f]Refresh" W.HINT
+        S" [l]Like [t]Repost [y]Reply [d]Delete [c]Compose [f]Refresh  [Enter]Open" W.HINT
     THEN ;
 
 \ SCR-BSKY-TL ( -- )   Timeline subscreen
@@ -2099,7 +2099,8 @@ VARIABLE _BSK-FI
     W.GAP
     S" Navigation" W.SECTION
     S" [n/p] Select next / previous post" W.LINE
-    S" [/]   Switch subscreen (Timeline/Notifs/Profile/Help)" W.LINE
+    S" [[/]] Switch subscreen ([ = prev, ] = next)" W.LINE
+    S" Enter  Open selected post full-screen" W.LINE
     S" [0-9] Switch to another KDOS screen" W.LINE
     W.GAP
     S" Timeline Actions" W.SECTION
@@ -2125,6 +2126,15 @@ VARIABLE _BSK-FI
 \
 \  BSKY-KEYS ( c -- consumed )
 \  Per-screen key handler.  Priority dispatch via CALL-SCREEN-KEY.
+
+\ _BSK-SWITCH-SUB ( delta -- )
+\   Move to adjacent subscreen (wrapping), reset selection state.
+: _BSK-SWITCH-SUB  ( delta -- )
+    SUBSCREEN-ID @ + DUP 0 < IF DROP SCREEN-SUBS 1- THEN
+    DUP SCREEN-SUBS >= IF DROP 0 THEN
+    SUBSCREEN-ID !
+    0 SCR-SEL !  0 SCR-MAX !
+    RENDER-SCREEN ;
 
 \ _BSK-ACT-LIKE ( -- )   Like the selected post
 : _BSK-ACT-LIKE  ( -- )
@@ -2168,9 +2178,57 @@ VARIABLE _BSK-FI
         S" Posted!" _BSK-SET-STATUS
     ELSE DROP THEN ;
 
+\ _BSK-TYPE-DECODED ( addr len -- )
+\   TYPE a raw JSON string, decoding backslash escapes:
+\   \n -> newline+indent   \t -> space   \\ -> \   \" -> "
+: _BSK-TYPE-DECODED  ( addr len -- )
+    BEGIN DUP 0> WHILE
+        OVER C@ 92 = IF              \ backslash
+            1 /STRING DUP 0> IF
+                OVER C@
+                DUP 110 = IF DROP CR ."   " ELSE  \ \n -> newline
+                DUP 116 = IF DROP SPACE       ELSE  \ \t -> space
+                DUP  92 = IF DROP 92 EMIT     ELSE  \ \\
+                DUP  34 = IF DROP 34 EMIT     ELSE  \ \"
+                              EMIT                   \ other: pass through
+                THEN THEN THEN THEN
+                1 /STRING
+            THEN
+        ELSE
+            OVER C@ EMIT
+            1 /STRING
+        THEN
+    REPEAT 2DROP ;
+
+\ _BSK-VIEW-POST ( -- )   Show full text of selected post, full-screen.
+: _BSK-VIEW-POST  ( -- )
+    SUBSCREEN-ID @ 0 <> IF EXIT THEN      \ only on Timeline subscreen
+    SCR-SEL @ DUP -1 = IF DROP EXIT THEN
+    DUP _BSK-TL-N @ >= IF DROP EXIT THEN
+    PAGE
+    CR
+    DUP _BSK-TL-HANDLE DUP 0> IF BOLD ."   @" TYPE RESET-COLOR ELSE 2DROP THEN
+    CR CR
+    ."   "
+    _BSK-TL-TEXT DUP 0> IF
+        _BSK-TYPE-DECODED CR
+    ELSE 2DROP THEN
+    CR
+    SCR-SEL @ _BSK-TL-URI DUP 0> IF
+        DIM ."   " TYPE RESET-COLOR CR
+    ELSE 2DROP THEN
+    CR HBAR CR
+    DIM ."   [y] Reply    any other key returns" RESET-COLOR CR
+    KEY DUP 121 = IF DROP _BSK-ACT-REPLY ELSE DROP THEN
+    RENDER-SCREEN ;
+
 \ BSKY-KEYS ( c -- consumed )
 \   Key handler for the Bluesky screen.
 : BSKY-KEYS  ( c -- consumed )
+    \ '['  = previous subscreen (with state reset)
+    DUP 91 = IF DROP -1 _BSK-SWITCH-SUB -1 EXIT THEN
+    \ ']'  = next subscreen (with state reset)
+    DUP 93 = IF DROP  1 _BSK-SWITCH-SUB -1 EXIT THEN
     \ 'f' = fetch/refresh (subscreen-dependent)
     DUP 102 = IF DROP
         _BSK-CLR-STATUS
@@ -2221,7 +2279,8 @@ VARIABLE _BSK-SCR-ID
 
 ' SCR-BSKY ' LBL-BSKY 1 REGISTER-SCREEN _BSK-SCR-ID !
 
-' BSKY-KEYS _BSK-SCR-ID @ SET-SCREEN-KEYS
+' BSKY-KEYS      _BSK-SCR-ID @ SET-SCREEN-KEYS
+' _BSK-VIEW-POST _BSK-SCR-ID @ SET-SCREEN-ACT
 
 ' SCR-BSKY-TL   ' LBL-BSKY-TL  _BSK-SCR-ID @ ADD-SUBSCREEN
 ' SCR-BSKY-NF   ' LBL-BSKY-NF  _BSK-SCR-ID @ ADD-SUBSCREEN
