@@ -473,8 +473,40 @@ def main():
                 continue
             print(f"  {line[:160]}")
 
+        # ── Stage 5 live test: BSK-POST ──────────────────────────────
+        print("\n--- Stage 5: BSK-POST (live post) ---")
+        buf.clear()
+        # Use a timestamped test message so we can find it
+        import datetime
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        test_msg = f"megapad-64 bsky.f live test [{ts}]"
+        # Escape for Forth S" string (no special chars needed here)
+        feed_lines(sys_obj, buf, [
+            f': _POSTTEST',
+            f'  S" {test_msg}" BSK-POST',
+            f'  ." [POST-STATUS] " BSK-HTTP-STATUS @ . CR',
+            f'  ." ##POST-DONE##" CR ;',
+        ])
+        buf.clear()
+        print(f'  Posting: "{test_msg}"')
+        steps = run_net_command(sys_obj, buf, ['_POSTTEST'],
+                               timeout_sec=120, sentinel="##POST-DONE")
+        post_text = uart_text(buf)
+        stage4_results['BSK-POST'] = post_text
+        print(f"  Completed in {steps:,} steps")
+        for line in post_text.strip().split("\n"):
+            line = line.strip()
+            if not line or line == 'ok' or line.startswith('>'):
+                continue
+            print(f"  {line[:160]}")
+
+        if "Posted!" in post_text:
+            print("\n  *** SUCCESS: BSK-POST created a skeet! ***")
+        else:
+            print("\n  *** FAILED: BSK-POST did not succeed ***")
+
     else:
-        print("\n--- Stage 4 live tests SKIPPED (login required) ---")
+        print("\n--- Stage 4+5 live tests SKIPPED (login required) ---")
 
     # Write stage 4 results to file for manual inspection
     if stage4_results:
