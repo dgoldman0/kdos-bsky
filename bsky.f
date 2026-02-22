@@ -2011,8 +2011,7 @@ VARIABLE _BSK-FI
     _BSK-TL-URI
     DUP 0> IF
         DIM ."   " 78 _BSK-TYPE-TRUNC RESET-COLOR CR
-    ELSE 2DROP THEN
-    S" [l]Like [t]Repost [y]Reply [d]Delete [c]Compose" W.HINT ;
+    ELSE 2DROP THEN ;
 
 \ ── §6.5  Screen Renderers ────────────────────────────────────────
 \
@@ -2022,15 +2021,31 @@ VARIABLE _BSK-FI
 : .BSK-PR-DN  ( -- )  _BSK-PR-DN _BSK-PR-DNL @ TYPE ;
 : .BSK-PR-HA  ( -- )  ." @" _BSK-PR-H _BSK-PR-HL @ TYPE ;
 
+\ Show whose feed this is in the title
+: .BSK-TL-TITLE  ( -- )
+    _BSK-TL-N @ 0> IF
+        ." @" BSK-HANDLE BSK-HANDLE-LEN @ TYPE ."  "
+    THEN ;
+
+\ Common hint bar for timeline subscreen
+: .BSK-TL-HINTS  ( -- )
+    _BSK-TL-N @ 0> IF
+        S" [l]Like [t]Repost [y]Reply [d]Delete [c]Compose [f]Refresh" W.HINT
+    THEN ;
+
 \ SCR-BSKY-TL ( -- )   Timeline subscreen
 : SCR-BSKY-TL  ( -- )
     _BSK-TL-N @ 0= IF
         S" Timeline" W.TITLE
-        S" Press [f] to fetch" W.HINT
+        S" Press [f] to fetch your timeline" W.HINT
     ELSE
         _BSK-TL-N @ S" Timeline" W.TITLE-N
+        W.GAP
+        ['] .BSK-TL-TITLE W.CUSTOM
         _BSK-TL-N @ ['] .BSK-TL-ROW W.LIST
         _BSK-TL-N @ ['] .BSK-TL-DETAIL W.DETAIL
+        W.GAP
+        .BSK-TL-HINTS
     THEN
     _BSK-STATUS-LEN @ 0> IF
         W.GAP
@@ -2041,10 +2056,12 @@ VARIABLE _BSK-FI
 : SCR-BSKY-NF  ( -- )
     _BSK-NF-N @ 0= IF
         S" Notifications" W.TITLE
-        S" Press [f] to fetch" W.HINT
+        S" Press [f] to fetch notifications" W.HINT
     ELSE
         _BSK-NF-N @ S" Notifications" W.TITLE-N
         _BSK-NF-N @ ['] .BSK-NF-ROW W.LIST
+        W.GAP
+        S" [f]Refresh  [n/p]Navigate" W.HINT
     THEN
     _BSK-STATUS-LEN @ 0> IF
         W.GAP
@@ -2055,7 +2072,7 @@ VARIABLE _BSK-FI
 : SCR-BSKY-PR  ( -- )
     _BSK-PR-OK @ 0= IF
         S" Profile" W.TITLE
-        S" Press [f] to fetch" W.HINT
+        S" Press [f] to fetch your profile" W.HINT
     ELSE
         S" Profile" W.TITLE
         ['] .BSK-PR-DN S" Name" W.KV-XT
@@ -2068,11 +2085,37 @@ VARIABLE _BSK-FI
             S" Bio" W.SECTION
             _BSK-PR-D _BSK-PR-DL @ W.LINE
         THEN
+        W.GAP
+        S" [f]Refresh" W.HINT
     THEN
     _BSK-STATUS-LEN @ 0> IF
         W.GAP
         _BSK-STATUS _BSK-STATUS-LEN @ W.HINT
     THEN ;
+
+\ SCR-BSKY-HELP ( -- )   Help / controls subscreen
+: SCR-BSKY-HELP  ( -- )
+    S" Bluesky Controls" W.TITLE
+    W.GAP
+    S" Navigation" W.SECTION
+    S" [n/p] Select next / previous post" W.LINE
+    S" [/]   Switch subscreen (Timeline/Notifs/Profile/Help)" W.LINE
+    S" [0-9] Switch to another KDOS screen" W.LINE
+    W.GAP
+    S" Timeline Actions" W.SECTION
+    S" [f]   Fetch / refresh current view" W.LINE
+    S" [l]   Like selected post" W.LINE
+    S" [t]   Repost selected post" W.LINE
+    S" [y]   Reply to selected post (Esc to cancel)" W.LINE
+    S" [d]   Delete selected post (yours only)" W.LINE
+    W.GAP
+    S" Compose" W.SECTION
+    S" [c]   Write a new post (Enter to send, Esc to cancel)" W.LINE
+    W.GAP
+    S" System" W.SECTION
+    S" [q]   Quit SCREENS, return to Forth prompt" W.LINE
+    S" [r]   Force screen redraw" W.LINE
+    S" [A]   Toggle auto-refresh" W.LINE ;
 
 \ SCR-BSKY ( -- )   Main screen (fallback if no subscreens)
 : SCR-BSKY  ( -- )
@@ -2130,7 +2173,11 @@ VARIABLE _BSK-FI
 : BSKY-KEYS  ( c -- consumed )
     \ 'f' = fetch/refresh (subscreen-dependent)
     DUP 102 = IF DROP
-        SUBSCREEN-ID @ 0 = IF _BSK-TL-FETCH THEN
+        _BSK-CLR-STATUS
+        SUBSCREEN-ID @ 0 = IF
+            0 BSK-TL-CURSOR-LEN !      \ reset cursor for fresh fetch
+            _BSK-TL-FETCH
+        THEN
         SUBSCREEN-ID @ 1 = IF _BSK-NF-FETCH THEN
         SUBSCREEN-ID @ 2 = IF _BSK-PR-FETCH THEN
         RENDER-SCREEN -1 EXIT
@@ -2168,6 +2215,7 @@ VARIABLE _BSK-FI
 : LBL-BSKY-TL  ." Timeline" ;
 : LBL-BSKY-NF  ." Notifs" ;
 : LBL-BSKY-PR  ." Profile" ;
+: LBL-BSKY-HLP ." Help" ;
 
 VARIABLE _BSK-SCR-ID
 
@@ -2175,9 +2223,10 @@ VARIABLE _BSK-SCR-ID
 
 ' BSKY-KEYS _BSK-SCR-ID @ SET-SCREEN-KEYS
 
-' SCR-BSKY-TL ' LBL-BSKY-TL _BSK-SCR-ID @ ADD-SUBSCREEN
-' SCR-BSKY-NF ' LBL-BSKY-NF _BSK-SCR-ID @ ADD-SUBSCREEN
-' SCR-BSKY-PR ' LBL-BSKY-PR _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-TL   ' LBL-BSKY-TL  _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-NF   ' LBL-BSKY-NF  _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-PR   ' LBL-BSKY-PR  _BSK-SCR-ID @ ADD-SUBSCREEN
+' SCR-BSKY-HELP ' LBL-BSKY-HLP _BSK-SCR-ID @ ADD-SUBSCREEN
 
 \ =====================================================================
 \  §6 — End of Interactive TUI

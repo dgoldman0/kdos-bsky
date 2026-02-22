@@ -44,6 +44,7 @@ REQUIRE config.f
 ." [autoexec] Logging in..." CR
 BSK-MY-HANDLE BSK-MY-PASS BSK-LOGIN-WITH
 ." [autoexec] Fetching timeline..." CR
+0 BSK-TL-CURSOR-LEN !
 _BSK-TL-FETCH
 ." [autoexec] Ready.  Entering SCREENS..." CR
 SCREENS

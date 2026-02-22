@@ -1283,9 +1283,9 @@ def test_stage6():
           ['_BSK-SCR-ID @ CELLS SCR-FLAGS + @ .'],
           "1 ")
 
-    check("Bsky has 3 subscreens",
+    check("Bsky has 4 subscreens",
           ['_BSK-SCR-ID @ CELLS SUB-COUNTS + @ .'],
-          "3 ")
+          "4 ")
 
 
 # ---------------------------------------------------------------------------
