@@ -20,13 +20,14 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR/emu"
 
-# Activate the venv (has the C++ accelerator built for its Python)
-source .venv/bin/activate
+# The C++ accelerator is built for Python 3.13 — use it directly.
+# (The project .venv is 3.12 and can't load the .so)
+PYTHON="${PYTHON:-python3.13}"
 
 # Build disk image if it doesn't exist
 if [ ! -f bsky-disk.img ]; then
     echo "Building disk image..."
-    python "$PROJECT_DIR/local_testing/build_disk.py"
+    $PYTHON "$PROJECT_DIR/local_testing/build_disk.py"
 fi
 
 echo "=========================================="
@@ -51,7 +52,7 @@ echo "  Ctrl+]  → drop to debug monitor"
 echo "  Ctrl+C  → exit"
 echo ""
 
-exec python cli.py \
+exec $PYTHON cli.py \
     --bios bios.rom \
     --storage bsky-disk.img \
     --nic-tap mp64tap0 \
