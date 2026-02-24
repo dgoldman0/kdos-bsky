@@ -53,7 +53,7 @@ echo "  Ctrl+C  → exit"
 echo ""
 
 exec $PYTHON cli.py \
-    --bios bios.rom \
+    --bios bios.asm \
     --storage bsky-disk.img \
     --nic-tap mp64tap0 \
     --cores 1 \
