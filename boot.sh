@@ -10,14 +10,15 @@
 #        sudo iptables -t nat -A POSTROUTING -s 10.64.0.1/24 ! -o mp64tap0 -j MASQUERADE
 #
 #   2. Build the disk image:
-#        cd emu && python build_disk.py
+#        python local_testing/build_disk.py
 #
 # Usage:
 #   ./boot.sh              # interactive console
 #   ./boot.sh --headless   # headless TCP server (connect via nc localhost 6464)
 
 set -e
-cd "$(dirname "$0")/emu"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR/emu"
 
 # Activate the venv (has the C++ accelerator built for its Python)
 source .venv/bin/activate
@@ -25,7 +26,7 @@ source .venv/bin/activate
 # Build disk image if it doesn't exist
 if [ ! -f bsky-disk.img ]; then
     echo "Building disk image..."
-    python build_disk.py
+    python "$PROJECT_DIR/local_testing/build_disk.py"
 fi
 
 echo "=========================================="

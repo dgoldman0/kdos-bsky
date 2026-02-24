@@ -1,6 +1,8 @@
 emu/
+local_testing/
 __pycache__/
 *.pyc
 config.f
 tmp/
 live_results.txt
+akashic/
