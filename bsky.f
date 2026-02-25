@@ -15,18 +15,18 @@ PROVIDED bsky.f
 \ All akashic .f files live flat on the disk (build_disk.py puts them
 \ in the root).  Bare filenames ensure the REQUIRE guard matches the
 \ names used by the akashic libs' own internal REQUIREs.
-REQUIRE string.f
-REQUIRE json.f
-REQUIRE datetime.f
-REQUIRE url.f
-REQUIRE headers.f
-REQUIRE base64.f
-REQUIRE http.f
-REQUIRE uri.f
-REQUIRE xrpc.f
-REQUIRE session.f
-REQUIRE aturi.f
-REQUIRE repo.f
+REQUIRE utils/string.f
+REQUIRE utils/json.f
+REQUIRE utils/datetime.f
+REQUIRE net/url.f
+REQUIRE net/headers.f
+REQUIRE net/base64.f
+REQUIRE net/http.f
+REQUIRE net/uri.f
+REQUIRE atproto/xrpc.f
+REQUIRE atproto/session.f
+REQUIRE atproto/aturi.f
+REQUIRE atproto/repo.f
 
 \ =====================================================================
 \  §0  Foundation Utilities
@@ -191,7 +191,7 @@ VARIABLE BSK-READY      0 BSK-READY !
     BSK-READY @ IF EXIT THEN
     BSK-RECV-MAX XMEM-ALLOT BSK-RECV-BUF !
     BSK-RECV-BUF @ BSK-RECV-MAX HTTP-USE-STATIC
-    S" KDOS/1.1 Megapad-64" HTTP-SET-UA
+    S" forth-bsky-client/0.1 KDOS/1.1" HTTP-SET-UA
     BSK-HANDLE BSK-HANDLE-MAX 0 FILL  0 BSK-HANDLE-LEN !
     -1 BSK-READY !
     ." bsky: init ok" CR ;
@@ -274,9 +274,9 @@ VARIABLE _BSK-URL-LEN
 
 : _BSK-SYNC-SESSION  ( -- )
     SESS-DID                         ( did-a did-u )
-    DUP BSK-DID-MAX MIN             \ clamp
-    DUP BSK-DID-LEN !
-    BSK-DID SWAP CMOVE
+    BSK-DID-MAX MIN                  ( did-a clamped )
+    DUP BSK-DID-LEN !               ( did-a clamped )
+    BSK-DID SWAP CMOVE              ( )
     1 BSK-ACCESS-LEN ! ;
 
 \ ── §3.2  Login ───────────────────────────────────────────────────
@@ -286,6 +286,8 @@ CREATE _BSK-LOGIN-HANDLE 128 ALLOT
 VARIABLE _BSK-LOGIN-HLEN   0 _BSK-LOGIN-HLEN !
 CREATE _BSK-LOGIN-PASS 128 ALLOT
 VARIABLE _BSK-LOGIN-PLEN   0 _BSK-LOGIN-PLEN !
+
+
 
 \ BSK-LOGIN-WITH ( handle-a handle-u pass-a pass-u -- )
 \   Programmatic login.  Saves handle locally, delegates to SESS-LOGIN.
@@ -1074,6 +1076,13 @@ VARIABLE _BSK-CI   \ cache index temp
     _BSK-STATUS SWAP CMOVE ;
 : _BSK-CLR-STATUS  ( -- )  0 _BSK-STATUS-LEN ! ;
 
+\ _BSK-HTTP-ERR-STATUS ( -- )  Set status to "HTTP <code>".
+: _BSK-HTTP-ERR-STATUS  ( -- )
+    BSK-RESET
+    S" HTTP " BSK-APPEND
+    BSK-HTTP-STATUS @ NUM>APPEND
+    BSK-BUF BSK-LEN @ _BSK-SET-STATUS ;
+
 \ ── §6.3  Fetch & Populate ────────────────────────────────────────
 \
 \  Fetch data from the API, parse JSON, fill cache arrays.
@@ -1130,7 +1139,7 @@ VARIABLE _BSK-FI
         S" Fetch failed" _BSK-SET-STATUS EXIT
     THEN
     BSK-HTTP-STATUS @ 200 <> IF 2DROP
-        S" HTTP error" _BSK-SET-STATUS EXIT
+        _BSK-HTTP-ERR-STATUS EXIT
     THEN
     \ Save cursor for pagination
     2DUP S" cursor" JSON-FIND-KEY
@@ -1198,7 +1207,7 @@ VARIABLE _BSK-FI
         S" Fetch failed" _BSK-SET-STATUS EXIT
     THEN
     BSK-HTTP-STATUS @ 200 <> IF 2DROP
-        S" HTTP error" _BSK-SET-STATUS EXIT
+        _BSK-HTTP-ERR-STATUS EXIT
     THEN
     0 _BSK-NF-N !
     2DUP S" notifications" JSON-FIND-KEY
@@ -1233,7 +1242,7 @@ VARIABLE _BSK-FI
         S" Fetch failed" _BSK-SET-STATUS EXIT
     THEN
     BSK-HTTP-STATUS @ 200 <> IF 2DROP
-        S" HTTP error" _BSK-SET-STATUS EXIT
+        _BSK-HTTP-ERR-STATUS EXIT
     THEN
     \ Cache displayName
     2DUP S" displayName" JSON-FIND-KEY

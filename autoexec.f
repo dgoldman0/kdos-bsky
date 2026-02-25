@@ -36,8 +36,9 @@ AUTOEXEC-NET
 _ENTER-UL
 
 \ ── Load user modules (into userland dictionary) ──────────────────────
-REQUIRE tools.f
+
 REQUIRE bsky.f
+
 REQUIRE config.f
 
 \ --- Login and enter TUI ---
